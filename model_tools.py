@@ -22,6 +22,7 @@ Public API (signatures preserved from the original 2,400-line version):
 
 import json
 import asyncio
+import os
 import logging
 import threading
 from typing import Dict, Any, List, Optional, Tuple
@@ -159,6 +160,7 @@ def _discover_tools():
         "tools.honcho_tools",
         "tools.homeassistant_tool",
         "tools.computer_use_tool",
+        "tools.pokemon_tool",
     ]
     import importlib
     for mod_name in _modules:
@@ -293,11 +295,15 @@ def get_tool_definitions(
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
 
-    # Plugin-registered tools are now resolved through the normal toolset
-    # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
-    # all check the tool registry for plugin-provided toolsets.  No bypass
-    # needed; plugins respect enabled_toolsets / disabled_toolsets like any
-    # other toolset.
+    # Always include plugin-registered tools — they bypass the toolset filter
+    # because their toolsets are dynamic (created at plugin load time).
+    try:
+        from hermes_cli.plugins import get_plugin_tool_names
+        plugin_tools = get_plugin_tool_names()
+        if plugin_tools:
+            tools_to_include.update(plugin_tools)
+    except Exception:
+        pass
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)

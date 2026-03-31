@@ -491,6 +491,7 @@ from cron import get_job
 # Resource cleanup imports for safe shutdown (terminal VMs, browser sessions)
 from tools.terminal_tool import cleanup_all_environments as _cleanup_all_terminals
 from tools.terminal_tool import set_sudo_password_callback, set_approval_callback
+from tools.computer_use_tool import set_approval_callback as set_computer_approval_callback
 from tools.skills_tool import set_secret_capture_callback
 try:
     from tools.computer_use_tool import set_approval_callback as set_computer_approval_callback

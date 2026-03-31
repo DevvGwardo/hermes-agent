@@ -113,15 +113,6 @@ DEFAULT_CONTEXT_LENGTHS = {
     "glm": 202752,
     # Kimi
     "kimi": 262144,
-    # Hugging Face Inference Providers — model IDs use org/name format
-    "Qwen/Qwen3.5-397B-A17B": 131072,
-    "Qwen/Qwen3.5-35B-A3B": 131072,
-    "deepseek-ai/DeepSeek-V3.2": 65536,
-    "moonshotai/Kimi-K2.5": 262144,
-    "moonshotai/Kimi-K2-Thinking": 262144,
-    "MiniMaxAI/MiniMax-M2.5": 204800,
-    "XiaomiMiMo/MiMo-V2-Flash": 32768,
-    "zai-org/GLM-5": 202752,
 }
 
 _CONTEXT_LENGTH_KEYS = (
@@ -171,11 +162,8 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "dashscope.aliyuncs.com": "alibaba",
     "dashscope-intl.aliyuncs.com": "alibaba",
     "openrouter.ai": "openrouter",
-    "generativelanguage.googleapis.com": "google",
     "inference-api.nousresearch.com": "nous",
     "api.deepseek.com": "deepseek",
-    "api.githubcopilot.com": "copilot",
-    "models.github.ai": "copilot",
 }
 
 
@@ -272,11 +260,9 @@ def detect_local_server_type(base_url: str) -> Optional[str]:
                         pass
             except Exception:
                 pass
-            # llama.cpp exposes /v1/props (older builds used /props without the /v1 prefix)
+            # llama.cpp exposes /props
             try:
-                r = client.get(f"{server_url}/v1/props")
-                if r.status_code != 200:
-                    r = client.get(f"{server_url}/props")  # fallback for older builds
+                r = client.get(f"{server_url}/props")
                 if r.status_code == 200 and "default_generation_settings" in r.text:
                     return "llamacpp"
             except Exception:
@@ -469,11 +455,8 @@ def fetch_endpoint_model_metadata(
             )
             if is_llamacpp:
                 try:
-                    # Try /v1/props first (current llama.cpp); fall back to /props for older builds
-                    base = candidate.rstrip("/").replace("/v1", "")
-                    props_resp = requests.get(base + "/v1/props", headers=headers, timeout=5)
-                    if not props_resp.ok:
-                        props_resp = requests.get(base + "/props", headers=headers, timeout=5)
+                    props_url = candidate.rstrip("/").replace("/v1", "") + "/props"
+                    props_resp = requests.get(props_url, headers=headers, timeout=5)
                     if props_resp.ok:
                         props = props_resp.json()
                         gen_settings = props.get("default_generation_settings", {})
@@ -800,12 +783,8 @@ def get_model_context_length(
         if cached is not None:
             return cached
 
-    # 2. Active endpoint metadata for truly custom/unknown endpoints.
-    # Known providers (Copilot, OpenAI, Anthropic, etc.) skip this — their
-    # /models endpoint may report a provider-imposed limit (e.g. Copilot
-    # returns 128k) instead of the model's full context (400k).  models.dev
-    # has the correct per-provider values and is checked at step 5+.
-    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
+    # 2. Active endpoint metadata for explicit custom routes
+    if _is_custom_endpoint(base_url):
         endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
         matched = endpoint_metadata.get(model)
         if not matched:
@@ -876,11 +855,10 @@ def get_model_context_length(
     # Only check `default_model in model` (is the key a substring of the input).
     # The reverse (`model in default_model`) causes shorter names like
     # "claude-sonnet-4" to incorrectly match "claude-sonnet-4-6" and return 1M.
-    model_lower = model.lower()
     for default_model, length in sorted(
         DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True
     ):
-        if default_model in model_lower:
+        if default_model in model:
             return length
 
     # 9. Query local server as last resort
@@ -901,68 +879,25 @@ def estimate_tokens_rough(text: str) -> int:
     return len(text) // 4
 
 
+# Rough token equivalent for an image content block in a multimodal message.
+# Used by estimate_messages_tokens_rough to account for screenshot tokens.
+_IMAGE_TOKEN_ESTIMATE = 800
+
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
-    """Rough token estimate for a message list (pre-flight only).
-
-    Excludes base64 image data from ``_anthropic_content_blocks`` which would
-    massively overcount tokens (a single screenshot's base64 is ~1MB of chars
-    but only costs ~1,465 API tokens).  Instead, each image block is counted
-    as a flat 1,500 tokens (Anthropic formula: width*height/750 for typical
-    1300x845 screenshots).
-    """
-    _IMAGE_TOKEN_ESTIMATE = 1500
-    total = 0
-    for msg in messages:
-        if not isinstance(msg, dict):
-            total += len(str(msg))
-            continue
-        # Count text content normally
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, str):
-                    total += len(block)
-                elif isinstance(block, dict):
-                    total += len(block.get("text", ""))
-        # Count tool_calls args (but not the huge function schema)
-        for tc in msg.get("tool_calls", []):
-            if isinstance(tc, dict):
-                fn = tc.get("function", {})
-                total += len(fn.get("arguments", ""))
-        # Count _anthropic_content_blocks: images as flat estimate, text normally
-        for block in msg.get("_anthropic_content_blocks", []):
-            if isinstance(block, dict):
-                if block.get("type") == "image":
-                    total += _IMAGE_TOKEN_ESTIMATE * 4  # * 4 because we divide by 4 below
-                else:
-                    total += len(block.get("text", ""))
-        # Role/metadata overhead
-        total += 20  # role, tool_call_id, etc.
-    return total // 4
-
-
-def estimate_request_tokens_rough(
-    messages: List[Dict[str, Any]],
-    *,
-    system_prompt: str = "",
-    tools: Optional[List[Dict[str, Any]]] = None,
-) -> int:
-    """Rough token estimate for a full chat-completions request.
-
-    Includes the major payload buckets Hermes sends to providers:
-    system prompt, conversation messages, and tool schemas.  With 50+
-    tools enabled, schemas alone can add 20-30K tokens — a significant
-    blind spot when only counting messages.
-
-    Uses ``estimate_messages_tokens_rough`` for messages to avoid
-    counting base64 image data as text tokens.
-    """
+    """Rough token estimate for a message list (pre-flight only)."""
     total_chars = 0
-    if system_prompt:
-        total_chars += len(system_prompt)
-    msg_tokens = estimate_messages_tokens_rough(messages) if messages else 0
-    if tools:
-        total_chars += len(str(tools))
-    return total_chars // 4 + msg_tokens
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Multimodal message: sum text tokens + image block tokens
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "image" or "image" in block.get("type", ""):
+                        total_chars += _IMAGE_TOKEN_ESTIMATE * 4  # convert to char equivalent
+                    else:
+                        total_chars += len(str(block.get("text", "")))
+                else:
+                    total_chars += len(str(block))
+        else:
+            total_chars += len(str(content))
+    return total_chars // 4

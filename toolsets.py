@@ -64,6 +64,9 @@ _HERMES_CORE_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Pokemon game control (gated on pokemon-agent server via check_fn)
+    "pokemon_observe", "pokemon_action", "pokemon_remember",
+    "pokemon_update_goal", "pokemon_save", "pokemon_load",
 ]
 
 
@@ -214,6 +217,20 @@ TOOLSETS = {
         "includes": []
     },
 
+    "pokemon": {
+        "description": "Pokemon game control: observe state, take actions, persistent memory, save/load",
+        "tools": [
+            "pokemon_observe", "pokemon_action", "pokemon_remember",
+            "pokemon_update_goal", "pokemon_save", "pokemon_load",
+        ],
+        "includes": []
+    },
+
+    "computer_use": {
+        "description": "Desktop control via screenshots, mouse, and keyboard (macOS, Anthropic only)",
+        "tools": ["computer"],
+        "includes": []
+    },
 
     # Scenario-specific toolsets
     
