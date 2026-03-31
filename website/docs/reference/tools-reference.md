@@ -36,6 +36,12 @@ This page documents the built-in Hermes tool registry as it exists in code. Avai
 |------|-------------|----------------------|
 | `execute_code` | Run a Python script that can call Hermes tools programmatically. Use this when you need 3+ tool calls with processing logic between them, need to filter/reduce large tool outputs before they enter your context, need conditional branching (… | — |
 
+## `computer_use` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `computer` | Control the macOS desktop — take screenshots, click, type, scroll, drag, and use keyboard shortcuts. Uses Anthropic's Computer Use API (`computer_20251124`). Actions: `screenshot`, `left_click`, `right_click`, `double_click`, `triple_click`, `middle_click`, `mouse_move`, `left_click_drag`, `left_mouse_down`, `left_mouse_up`, `type`, `key`, `hold_key`, `scroll`, `zoom`, `wait`. Requires macOS, pyautogui, Quartz, and Anthropic native API. | macOS + Anthropic provider |
+
 ## `cronjob` toolset
 
 | Tool | Description | Requires environment |
@@ -160,15 +166,4 @@ This page documents the built-in Hermes tool registry as it exists in code. Avai
 |------|-------------|----------------------|
 | `text_to_speech` | Convert text to speech audio. Returns a MEDIA: path that the platform delivers as a voice message. On Telegram it plays as a voice bubble, on Discord/WhatsApp as an audio attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider… | — |
 
-## `vision` toolset
 
-| Tool | Description | Requires environment |
-|------|-------------|----------------------|
-| `vision_analyze` | Analyze images using AI vision. Provides a comprehensive description and answers a specific question about the image content. | — |
-
-## `web` toolset
-
-| Tool | Description | Requires environment |
-|------|-------------|----------------------|
-| `web_extract` | Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdow… | FIRECRAWL_API_KEY |
-| `web_search` | Search the web for information on any topic. Returns up to 5 relevant results with titles, URLs, and descriptions. | FIRECRAWL_API_KEY |

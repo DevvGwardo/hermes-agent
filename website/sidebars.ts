@@ -9,6 +9,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'getting-started/quickstart',
         'getting-started/installation',
+        'getting-started/nix-setup',
         'getting-started/updating',
         'getting-started/learning-path',
       ],
@@ -25,6 +26,7 @@ const sidebars: SidebarsConfig = {
         'guides/use-mcp-with-hermes',
         'guides/use-soul-with-hermes',
         'guides/use-voice-mode-with-hermes',
+        'guides/migrate-from-openclaw',
       ],
     },
     {
@@ -36,6 +38,8 @@ const sidebars: SidebarsConfig = {
         'user-guide/configuration',
         'user-guide/sessions',
         'user-guide/security',
+        'user-guide/docker',
+        'user-guide/profiles',
         {
           type: 'category',
           label: 'Messaging Gateway',
@@ -51,6 +55,8 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/mattermost',
             'user-guide/messaging/matrix',
             'user-guide/messaging/dingtalk',
+              'user-guide/messaging/feishu',
+              'user-guide/messaging/wecom',
             'user-guide/messaging/open-webui',
             'user-guide/messaging/webhooks',
           ],
@@ -108,6 +114,13 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/rl-training',
           ],
         },
+        {
+          type: 'category',
+          label: 'Skills',
+          items: [
+            'user-guide/skills/godmode',
+          ],
+        },
       ],
     },
     {
@@ -129,6 +142,7 @@ const sidebars: SidebarsConfig = {
         'developer-guide/environments',
         'developer-guide/adding-tools',
         'developer-guide/creating-skills',
+        'developer-guide/extending-the-cli',
         'developer-guide/contributing',
       ],
     },
@@ -143,6 +157,7 @@ const sidebars: SidebarsConfig = {
         'reference/mcp-config-reference',
         'reference/skills-catalog',
         'reference/optional-skills-catalog',
+        'reference/profile-commands',
         'reference/environment-variables',
         'reference/faq',
       ],
