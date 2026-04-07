@@ -1,0 +1,8 @@
+name: brain-mcp
+version: 1.0.0
+description: "Cross-session memory via brain-mcp — shares knowledge between hermes, Claude Code, and swarm agents"
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation
