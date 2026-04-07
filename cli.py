@@ -6891,6 +6891,7 @@ class HermesCLI:
             db = None
             spinner_tick = 0
             db_poll_counter = 0
+            my_lead_id = None  # brain session ID of THIS hermes instance's MCP server
             while not self._brain_agents_shutting_down:
                 try:
                     # DB poll every ~2s (8 ticks * 0.25s), spinner animates every tick
@@ -6907,10 +6908,53 @@ class HermesCLI:
                                 db_poll_counter += 8
                                 continue
                             db = BrainDB(db_path)
+                        import json as _json
                         sessions = db.get_sessions(room=os.getcwd())
-                        # get_sessions already prunes stale sessions (>5min) and
-                        # filters to recent heartbeats — no extra parent check needed
-                        agents = [s for s in sessions if s.name != "hermes"]
+
+                        # Find this hermes instance's brain MCP lead session.
+                        # The brain MCP server registers with name "session-{pid}"
+                        # where pid is the MCP server's process pid. Its parent is
+                        # the hermes process (os.getpid()), so we match by pid.
+                        if my_lead_id is None:
+                            my_pid = os.getpid()
+                            for s in sessions:
+                                # MCP server's pid is stored in sessions table,
+                                # and its parent process is hermes (our pid)
+                                try:
+                                    if s.pid and os.getppid() != 1:
+                                        # Check if this session's process is a child of ours
+                                        import subprocess
+                                        result = subprocess.run(
+                                            ['ps', '-o', 'ppid=', '-p', str(s.pid)],
+                                            capture_output=True, text=True, timeout=1
+                                        )
+                                        ppid = result.stdout.strip()
+                                        if ppid == str(my_pid):
+                                            my_lead_id = s.id
+                                            break
+                                except Exception:
+                                    pass
+
+                        # Filter: only show agents spawned by OUR lead session
+                        agents = []
+                        for s in sessions:
+                            if s.name == "hermes":
+                                continue
+                            if my_lead_id and s.id == my_lead_id:
+                                continue  # skip the lead itself
+                            try:
+                                meta = _json.loads(s.metadata) if s.metadata else None
+                                parent = meta.get('parent_session_id') if meta else None
+                                if my_lead_id:
+                                    # Only show agents belonging to our lead
+                                    if parent != my_lead_id:
+                                        continue
+                                else:
+                                    # No lead found yet — don't show anything
+                                    continue
+                            except Exception:
+                                continue
+                            agents.append(s)
                         self._brain_agents = agents
 
                     # Advance spinner frame for active agents
