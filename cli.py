@@ -6907,23 +6907,10 @@ class HermesCLI:
                                 db_poll_counter += 8
                                 continue
                             db = BrainDB(db_path)
-                        import json as _json
                         sessions = db.get_sessions(room=os.getcwd())
-                        # get_sessions already filters to 5-min heartbeat
-                        active_ids = {s.id for s in sessions}
-                        agents = []
-                        for s in sessions:
-                            if s.name == "hermes":
-                                continue
-                            # Only show agents whose parent is still active
-                            try:
-                                meta = _json.loads(s.metadata) if s.metadata else None
-                                parent_id = meta.get('parent_session_id') if meta else None
-                                if parent_id and parent_id not in active_ids:
-                                    continue  # orphaned — parent session gone
-                            except Exception:
-                                pass
-                            agents.append(s)
+                        # get_sessions already prunes stale sessions (>5min) and
+                        # filters to recent heartbeats — no extra parent check needed
+                        agents = [s for s in sessions if s.name != "hermes"]
                         self._brain_agents = agents
 
                     # Advance spinner frame for active agents

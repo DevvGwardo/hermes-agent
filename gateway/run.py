@@ -6373,6 +6373,23 @@ class GatewayRunner:
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                    elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__brain_agents__":
+                        # Brain agent status block — replace previous block or append
+                        _, block = raw
+                        # Find and replace existing brain agents block
+                        replaced = False
+                        for idx, line in enumerate(progress_lines):
+                            if line.startswith("\u2500 Brain Agents"):
+                                # Replace from this line to the next non-agent line
+                                end = idx + 1
+                                while end < len(progress_lines) and progress_lines[end].startswith("  "):
+                                    end += 1
+                                progress_lines[idx:end] = block.split("\n")
+                                replaced = True
+                                break
+                        if not replaced:
+                            progress_lines.extend(block.split("\n"))
+                        msg = block
                     else:
                         msg = raw
                         progress_lines.append(msg)
@@ -6939,10 +6956,68 @@ class GatewayRunner:
                 "session_id": effective_session_id,
             }
         
+        # Brain agent status for gateway — polls brain.db and pushes formatted
+        # status into the progress queue so it shows in Discord/Telegram messages
+        async def poll_brain_agents_for_gateway():
+            if not progress_queue:
+                return
+            db = None
+            prev_status = ""
+            while True:
+                try:
+                    if db is None:
+                        import sys as _sys
+                        _brain_path = str(Path.home() / "brain-mcp")
+                        if _brain_path not in _sys.path:
+                            _sys.path.insert(0, _brain_path)
+                        from hermes.db import BrainDB
+                        db_path = os.environ.get("BRAIN_DB_PATH", str(Path.home() / ".claude" / "brain" / "brain.db"))
+                        if not os.path.exists(db_path):
+                            await asyncio.sleep(5)
+                            continue
+                        db = BrainDB(db_path)
+                    sessions = db.get_sessions(room=os.getcwd())
+                    agents = [s for s in sessions if s.name != "hermes"]
+                    if agents:
+                        lines = []
+                        for a in agents:
+                            status = getattr(a, 'status', 'idle')
+                            name = getattr(a, 'name', '?')
+                            progress = getattr(a, 'progress', '') or ''
+                            if status == 'done':
+                                icon = '\u2713'
+                            elif status == 'failed':
+                                icon = '\u2717'
+                            elif status == 'working':
+                                icon = '\u25cf'
+                            else:
+                                icon = '\u25cb'
+                            prog = progress[:25] if progress else status
+                            lines.append(f"  {icon} {name}: {prog}")
+                        block = "\u2500 Brain Agents \u2500\n" + "\n".join(lines)
+                        if block != prev_status:
+                            prev_status = block
+                            progress_queue.put(("__brain_agents__", block))
+                    elif prev_status:
+                        prev_status = ""
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+            if db:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+        brain_gateway_task = None
+
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
+            brain_gateway_task = asyncio.create_task(poll_brain_agents_for_gateway())
 
         # Start stream consumer task — polls for consumer creation since it
         # happens inside run_sync (thread pool) after the agent is constructed.
@@ -7251,6 +7326,8 @@ class GatewayRunner:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
                 progress_task.cancel()
+            if brain_gateway_task:
+                brain_gateway_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
 
@@ -7273,7 +7350,7 @@ class GatewayRunner:
                 self._running_agents_ts.pop(session_key, None)
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [progress_task, brain_gateway_task, interrupt_monitor, tracking_task, _notify_task]:
                 if task:
                     try:
                         await task
