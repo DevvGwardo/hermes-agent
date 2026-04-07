@@ -1080,3 +1080,88 @@ def format_context_pressure_gateway(
         hint = "Auto-compaction is disabled — context may be truncated."
 
     return f"{icon} Context: {bar} {pct_int}% to compaction\n{hint}"
+
+
+# =========================================================================
+# Brain agent panel — shared logic for CLI + gateway
+# =========================================================================
+
+def get_active_brain_agents(room: str = None) -> list:
+    """Query brain.db and return a clean list of active agents.
+
+    Handles: dedup by name, PID liveness, done/failed filtering.
+    Returns Session-like objects with: name, status, progress, last_heartbeat, pid, metadata.
+    Returns empty list if brain.db is unavailable.
+    """
+    try:
+        _brain_path = str(Path.home() / "brain-mcp")
+        if _brain_path not in sys.path:
+            sys.path.insert(0, _brain_path)
+        from hermes.db import BrainDB
+
+        db_path = os.environ.get("BRAIN_DB_PATH", str(Path.home() / ".claude" / "brain" / "brain.db"))
+        if not os.path.exists(db_path):
+            return []
+
+        db = BrainDB(db_path)
+        sessions = db.get_sessions(room=room or os.getcwd())
+        db.close()
+
+        agents = []
+        for s in sessions:
+            # Skip hermes itself
+            if s.name == "hermes":
+                continue
+            # Skip finished
+            if s.status in ('done', 'failed'):
+                continue
+            # Skip dead processes
+            if s.pid:
+                try:
+                    os.kill(s.pid, 0)
+                except OSError:
+                    continue
+            agents.append(s)
+
+        # Deduplicate by name — brain_wake pre-registers a ghost session,
+        # then the real agent registers with the same name but fresh heartbeat
+        by_name = {}
+        for a in agents:
+            existing = by_name.get(a.name)
+            if existing is None:
+                by_name[a.name] = a
+            elif (a.last_heartbeat or '') > (existing.last_heartbeat or ''):
+                by_name[a.name] = a
+        return list(by_name.values())
+
+    except Exception:
+        return []
+
+
+def format_brain_agents_text(agents: list) -> str:
+    """Format brain agents as plain text for Discord/Telegram messages.
+
+    Returns empty string if no agents.
+    """
+    if not agents:
+        return ""
+
+    lines = []
+    for a in agents:
+        status = getattr(a, 'status', 'idle')
+        name = getattr(a, 'name', '?')
+        progress = getattr(a, 'progress', '') or ''
+
+        if status == 'working':
+            icon = '\u25cf'   # ●
+        elif status == 'done':
+            icon = '\u2713'   # ✓
+        elif status == 'failed':
+            icon = '\u2717'   # ✗
+        else:
+            icon = '\u25cb'   # ○
+
+        prog = progress[:28] if progress else status
+        lines.append(f"  {icon} {name}: {prog}")
+
+    return "\u2500 Brain Agents \u2500\n" + "\n".join(lines)

@@ -6349,6 +6349,19 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id
         _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
+        def _remove_brain_block(lines):
+            """Remove the brain agents block from progress_lines."""
+            idx = None
+            for i, line in enumerate(lines):
+                if line.startswith("\u2500 Brain Agents"):
+                    idx = i
+                    break
+            if idx is not None:
+                end = idx + 1
+                while end < len(lines) and lines[end].startswith("  "):
+                    end += 1
+                del lines[idx:end]
+
         async def send_progress_messages():
             if not progress_queue:
                 return
@@ -6373,26 +6386,22 @@ class GatewayRunner:
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
-                    elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__brain_agents__":
+                    elif isinstance(raw, tuple) and raw[0] == "__brain_agents__":
                         # Brain agent status block — replace previous block or append
                         _, block = raw
-                        # Find and replace existing brain agents block
-                        replaced = False
-                        for idx, line in enumerate(progress_lines):
-                            if line.startswith("\u2500 Brain Agents"):
-                                # Replace from this line to the next non-agent line
-                                end = idx + 1
-                                while end < len(progress_lines) and progress_lines[end].startswith("  "):
-                                    end += 1
-                                progress_lines[idx:end] = block.split("\n")
-                                replaced = True
-                                break
-                        if not replaced:
-                            progress_lines.extend(block.split("\n"))
+                        _remove_brain_block(progress_lines)
+                        progress_lines.extend(block.split("\n"))
                         msg = block
+                    elif isinstance(raw, tuple) and raw[0] == "__brain_agents_clear__":
+                        # All agents finished — remove the block
+                        _remove_brain_block(progress_lines)
+                        msg = None
                     else:
                         msg = raw
                         progress_lines.append(msg)
+
+                    if msg is None:
+                        continue  # clear event — no message to send
 
                     # Throttle edits: batch rapid tool updates into fewer
                     # API calls to avoid hitting Telegram flood control.
@@ -6961,55 +6970,24 @@ class GatewayRunner:
         async def poll_brain_agents_for_gateway():
             if not progress_queue:
                 return
-            db = None
+            from agent.display import get_active_brain_agents, format_brain_agents_text
             prev_status = ""
             while True:
                 try:
-                    if db is None:
-                        import sys as _sys
-                        _brain_path = str(Path.home() / "brain-mcp")
-                        if _brain_path not in _sys.path:
-                            _sys.path.insert(0, _brain_path)
-                        from hermes.db import BrainDB
-                        db_path = os.environ.get("BRAIN_DB_PATH", str(Path.home() / ".claude" / "brain" / "brain.db"))
-                        if not os.path.exists(db_path):
-                            await asyncio.sleep(5)
-                            continue
-                        db = BrainDB(db_path)
-                    sessions = db.get_sessions(room=os.getcwd())
-                    agents = [s for s in sessions if s.name != "hermes"]
-                    if agents:
-                        lines = []
-                        for a in agents:
-                            status = getattr(a, 'status', 'idle')
-                            name = getattr(a, 'name', '?')
-                            progress = getattr(a, 'progress', '') or ''
-                            if status == 'done':
-                                icon = '\u2713'
-                            elif status == 'failed':
-                                icon = '\u2717'
-                            elif status == 'working':
-                                icon = '\u25cf'
-                            else:
-                                icon = '\u25cb'
-                            prog = progress[:25] if progress else status
-                            lines.append(f"  {icon} {name}: {prog}")
-                        block = "\u2500 Brain Agents \u2500\n" + "\n".join(lines)
-                        if block != prev_status:
-                            prev_status = block
-                            progress_queue.put(("__brain_agents__", block))
-                    elif prev_status:
+                    agents = get_active_brain_agents()
+                    block = format_brain_agents_text(agents)
+                    if block and block != prev_status:
+                        prev_status = block
+                        progress_queue.put(("__brain_agents__", block))
+                    elif not block and prev_status:
+                        # Agents all gone — push empty to clear the block
                         prev_status = ""
+                        progress_queue.put(("__brain_agents_clear__",))
                 except asyncio.CancelledError:
                     break
                 except Exception:
                     pass
                 await asyncio.sleep(3)
-            if db:
-                try:
-                    db.close()
-                except Exception:
-                    pass
 
         brain_gateway_task = None
 

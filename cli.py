@@ -6888,103 +6888,17 @@ class HermesCLI:
             return
 
         def _poll():
-            db = None
+            from agent.display import get_active_brain_agents
             spinner_tick = 0
-            db_poll_counter = 0
-            my_lead_id = None  # brain session ID of THIS hermes instance's MCP server
+            tick = 0
             while not self._brain_agents_shutting_down:
                 try:
-                    # DB poll every ~2s (8 ticks * 0.25s), spinner animates every tick
-                    if db_poll_counter % 8 == 0:
-                        if db is None:
-                            import sys as _sys
-                            _brain_path = str(Path.home() / "brain-mcp")
-                            if _brain_path not in _sys.path:
-                                _sys.path.insert(0, _brain_path)
-                            from hermes.db import BrainDB
-                            db_path = os.environ.get("BRAIN_DB_PATH", str(Path.home() / ".claude" / "brain" / "brain.db"))
-                            if not os.path.exists(db_path):
-                                import time; time.sleep(2)
-                                db_poll_counter += 8
-                                continue
-                            db = BrainDB(db_path)
-                        import json as _json
-                        sessions = db.get_sessions(room=os.getcwd())
+                    # DB poll every ~2s (16 ticks * 0.12s), spinner every tick
+                    if tick % 16 == 0:
+                        self._brain_agents = get_active_brain_agents()
 
-                        # Find this hermes instance's brain MCP lead session.
-                        # The brain MCP server registers with name "session-{pid}"
-                        # where pid is the MCP server's process pid. Its parent is
-                        # the hermes process (os.getpid()), so we match by pid.
-                        if my_lead_id is None:
-                            my_pid = os.getpid()
-                            for s in sessions:
-                                # MCP server's pid is stored in sessions table,
-                                # and its parent process is hermes (our pid)
-                                try:
-                                    if s.pid and os.getppid() != 1:
-                                        # Check if this session's process is a child of ours
-                                        import subprocess
-                                        result = subprocess.run(
-                                            ['ps', '-o', 'ppid=', '-p', str(s.pid)],
-                                            capture_output=True, text=True, timeout=1
-                                        )
-                                        ppid = result.stdout.strip()
-                                        if ppid == str(my_pid):
-                                            my_lead_id = s.id
-                                            break
-                                except Exception:
-                                    pass
-
-                        # Filter: only show agents spawned by OUR lead session
-                        agents = []
-                        for s in sessions:
-                            if s.name == "hermes":
-                                continue
-                            if my_lead_id and s.id == my_lead_id:
-                                continue  # skip the lead itself
-                            try:
-                                meta = _json.loads(s.metadata) if s.metadata else None
-                                parent = meta.get('parent_session_id') if meta else None
-                                if my_lead_id:
-                                    # Only show agents belonging to our lead
-                                    if parent != my_lead_id:
-                                        continue
-                                else:
-                                    # No lead found yet — don't show anything
-                                    continue
-                            except Exception:
-                                continue
-                            # Hide finished agents
-                            if s.status in ('done', 'failed'):
-                                continue
-                            # Check if process is still alive — drop immediately if dead
-                            if s.pid:
-                                try:
-                                    os.kill(s.pid, 0)
-                                except OSError:
-                                    continue
-                            agents.append(s)
-
-                        # Deduplicate by name — keep the session with the freshest heartbeat.
-                        # brain_wake pre-registers a ghost session, then the real agent
-                        # registers its own session with the same name but different PID.
-                        by_name = {}
-                        for a in agents:
-                            existing = by_name.get(a.name)
-                            if existing is None:
-                                by_name[a.name] = a
-                            else:
-                                # Keep whichever has the more recent heartbeat
-                                if (a.last_heartbeat or '') > (existing.last_heartbeat or ''):
-                                    by_name[a.name] = a
-                        self._brain_agents = list(by_name.values())
-
-                    # Advance spinner frame for active agents
-                    has_active = len(self._brain_agents) > 0 and any(
-                        getattr(a, 'status', '') in ('working', 'idle')
-                        for a in self._brain_agents
-                    )
-                    if has_active or db_poll_counter % 8 == 0:
+                    # Animate spinner if any agents are showing
+                    if self._brain_agents:
                         self._brain_spinner_frame = spinner_tick % len(self._SPINNER_FRAMES)
                         spinner_tick += 1
                         try:
@@ -6992,15 +6906,10 @@ class HermesCLI:
                         except Exception:
                             pass
 
-                    db_poll_counter += 1
+                    tick += 1
                 except Exception:
-                    db_poll_counter += 1
+                    tick += 1
                 import time; time.sleep(0.12)
-            if db:
-                try:
-                    db.close()
-                except Exception:
-                    pass
 
         self._brain_agents_poll_thread = threading.Thread(
             target=_poll, daemon=True, name="brain-agent-poll"
