@@ -6960,11 +6960,24 @@ class HermesCLI:
                             # Check if process is still alive — drop immediately if dead
                             if s.pid:
                                 try:
-                                    os.kill(s.pid, 0)  # signal 0 = existence check
+                                    os.kill(s.pid, 0)
                                 except OSError:
-                                    continue  # process dead — drop it
+                                    continue
                             agents.append(s)
-                        self._brain_agents = agents
+
+                        # Deduplicate by name — keep the session with the freshest heartbeat.
+                        # brain_wake pre-registers a ghost session, then the real agent
+                        # registers its own session with the same name but different PID.
+                        by_name = {}
+                        for a in agents:
+                            existing = by_name.get(a.name)
+                            if existing is None:
+                                by_name[a.name] = a
+                            else:
+                                # Keep whichever has the more recent heartbeat
+                                if (a.last_heartbeat or '') > (existing.last_heartbeat or ''):
+                                    by_name[a.name] = a
+                        self._brain_agents = list(by_name.values())
 
                     # Advance spinner frame for active agents
                     has_active = len(self._brain_agents) > 0 and any(
