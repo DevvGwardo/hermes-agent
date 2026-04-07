@@ -1460,6 +1460,7 @@ class HermesCLI:
         self._brain_agents: list = []
         self._brain_agents_poll_thread: Optional[threading.Thread] = None
         self._brain_agents_shutting_down = False
+        self._brain_spinner_frame: int = 0
 
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
@@ -6879,6 +6880,8 @@ class HermesCLI:
 
     # --- Brain agent panel ---------------------------------------------------
 
+    _SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
     def _start_brain_agent_poll(self) -> None:
         """Start a daemon thread that polls brain.db for active agents."""
         if self._brain_agents_poll_thread is not None:
@@ -6886,33 +6889,45 @@ class HermesCLI:
 
         def _poll():
             db = None
+            spinner_tick = 0
+            db_poll_counter = 0
             while not self._brain_agents_shutting_down:
                 try:
-                    if db is None:
-                        import sys as _sys
-                        _brain_path = str(Path.home() / "brain-mcp")
-                        if _brain_path not in _sys.path:
-                            _sys.path.insert(0, _brain_path)
-                        from hermes.db import BrainDB
-                        db_path = os.environ.get("BRAIN_DB_PATH", str(Path.home() / ".claude" / "brain" / "brain.db"))
-                        if not os.path.exists(db_path):
-                            import time; time.sleep(5)
-                            continue
-                        db = BrainDB(db_path)
-                    agents = db.get_agent_health(room=os.getcwd())
-                    # Filter out self (hermes session) — only show spawned agents
-                    agents = [a for a in agents if a.name != "hermes"]
-                    prev = [(a.name, a.status) for a in self._brain_agents]
-                    curr = [(a.name, a.status) for a in agents]
-                    if prev != curr:
+                    # DB poll every ~2s (8 ticks * 0.25s), spinner animates every tick
+                    if db_poll_counter % 8 == 0:
+                        if db is None:
+                            import sys as _sys
+                            _brain_path = str(Path.home() / "brain-mcp")
+                            if _brain_path not in _sys.path:
+                                _sys.path.insert(0, _brain_path)
+                            from hermes.db import BrainDB
+                            db_path = os.environ.get("BRAIN_DB_PATH", str(Path.home() / ".claude" / "brain" / "brain.db"))
+                            if not os.path.exists(db_path):
+                                import time; time.sleep(2)
+                                db_poll_counter += 8
+                                continue
+                            db = BrainDB(db_path)
+                        agents = db.get_agent_health(room=os.getcwd())
+                        agents = [a for a in agents if a.name != "hermes" and a.heartbeat_age_seconds < 120]
                         self._brain_agents = agents
+
+                    # Advance spinner frame for working agents
+                    has_working = any(
+                        getattr(a, 'status', '') == 'working'
+                        for a in self._brain_agents
+                    )
+                    if has_working or db_poll_counter % 8 == 0:
+                        self._brain_spinner_frame = spinner_tick % len(self._SPINNER_FRAMES)
+                        spinner_tick += 1
                         try:
-                            self._invalidate(min_interval=0.15)
+                            self._invalidate(min_interval=0.0)
                         except Exception:
                             pass
+
+                    db_poll_counter += 1
                 except Exception:
-                    pass
-                import time; time.sleep(1.5)
+                    db_poll_counter += 1
+                import time; time.sleep(0.12)
             if db:
                 try:
                     db.close()
@@ -6932,6 +6947,8 @@ class HermesCLI:
 
         fragments = []
         border = 'class:agent-panel-border'
+        frame_idx = getattr(self, '_brain_spinner_frame', 0)
+        spinner_char = self._SPINNER_FRAMES[frame_idx % len(self._SPINNER_FRAMES)]
 
         # Top border
         fragments.append((border, ' \u2500\u2500 Brain Agents '))
@@ -6944,21 +6961,21 @@ class HermesCLI:
             age = getattr(agent, 'heartbeat_age_seconds', 0)
             is_stale = getattr(agent, 'is_stale', False)
 
-            # Status indicator
+            # Status indicator — animated spinner for working agents
             if is_stale:
                 indicator = '\u25cc'  # ◌
                 style = 'class:agent-stale'
             elif status == 'done':
-                indicator = '\u25cb'  # ○
+                indicator = '\u2713'  # ✓
                 style = 'class:agent-done'
             elif status == 'failed':
                 indicator = '\u2717'  # ✗
                 style = 'class:agent-failed'
             elif status == 'working':
-                indicator = '\u25cf'  # ●
+                indicator = spinner_char  # ⠋⠙⠹... animated
                 style = 'class:agent-working'
             else:
-                indicator = '\u25c9'  # ◉
+                indicator = '\u25cb'  # ○
                 style = 'class:agent-waiting'
 
             # Try to get agent color from metadata
@@ -6977,13 +6994,16 @@ class HermesCLI:
             # Duration
             duration = f"{age}s" if age < 60 else f"{age // 60}m{age % 60}s"
 
+            # Truncate progress to fit
+            prog_display = progress[:22]
+
             fragments.append((style, f'  {indicator} '))
             fragments.append((name_style, f'{name:<18s}'))
-            fragments.append(('class:agent-progress', f'{progress[:20]:<20s} '))
+            fragments.append(('class:agent-progress', f'{prog_display:<22s} '))
             fragments.append(('class:agent-duration', f'{duration}\n'))
 
         # Bottom border
-        fragments.append((border, ' ' + '\u2500' * 42 + '\n'))
+        fragments.append((border, ' ' + '\u2500' * 46 + '\n'))
 
         return fragments
 
