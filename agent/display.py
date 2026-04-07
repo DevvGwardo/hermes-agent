@@ -1089,9 +1089,8 @@ def format_context_pressure_gateway(
 def get_active_brain_agents(room: str = None) -> list:
     """Query brain.db and return a clean list of active agents.
 
-    Handles: dedup by name, PID liveness, done/failed filtering.
-    Returns Session-like objects with: name, status, progress, last_heartbeat, pid, metadata.
-    Returns empty list if brain.db is unavailable.
+    Handles ghost session detection, PID liveness, done/failed filtering,
+    and dedup. Returns Session objects. Empty list if brain.db unavailable.
     """
     try:
         _brain_path = str(Path.home() / "brain-mcp")
@@ -1107,13 +1106,25 @@ def get_active_brain_agents(room: str = None) -> list:
         sessions = db.get_sessions(room=room or os.getcwd())
         db.close()
 
+        # Step 1: Identify ghost PIDs.
+        # brain_wake/brain_swarm pre-registers sessions with the MCP server's
+        # PID. These ghosts share that PID. Real agents each have their own
+        # unique PID. Count sessions per PID — any PID with 3+ sessions is
+        # the MCP server, and those sessions are ghosts.
+        from collections import Counter
+        pid_counts = Counter(s.pid for s in sessions if s.pid)
+        ghost_pids = {pid for pid, count in pid_counts.items() if count >= 3}
+
         agents = []
         for s in sessions:
-            # Skip hermes itself
-            if s.name == "hermes":
+            # Skip hermes itself and lead sessions (session-XXXXX pattern)
+            if s.name == "hermes" or s.name.startswith("session-"):
                 continue
             # Skip finished
             if s.status in ('done', 'failed'):
+                continue
+            # Skip ghost sessions (pre-registered by MCP server, never claimed)
+            if s.pid in ghost_pids:
                 continue
             # Skip dead processes
             if s.pid:
@@ -1123,8 +1134,7 @@ def get_active_brain_agents(room: str = None) -> list:
                     continue
             agents.append(s)
 
-        # Deduplicate by name — brain_wake pre-registers a ghost session,
-        # then the real agent registers with the same name but fresh heartbeat
+        # Deduplicate by name — keep freshest heartbeat
         by_name = {}
         for a in agents:
             existing = by_name.get(a.name)
