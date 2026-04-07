@@ -6907,16 +6907,31 @@ class HermesCLI:
                                 db_poll_counter += 8
                                 continue
                             db = BrainDB(db_path)
-                        agents = db.get_agent_health(room=os.getcwd())
-                        agents = [a for a in agents if a.name != "hermes" and a.heartbeat_age_seconds < 120]
+                        import json as _json
+                        sessions = db.get_sessions(room=os.getcwd())
+                        # get_sessions already filters to 5-min heartbeat
+                        active_ids = {s.id for s in sessions}
+                        agents = []
+                        for s in sessions:
+                            if s.name == "hermes":
+                                continue
+                            # Only show agents whose parent is still active
+                            try:
+                                meta = _json.loads(s.metadata) if s.metadata else None
+                                parent_id = meta.get('parent_session_id') if meta else None
+                                if parent_id and parent_id not in active_ids:
+                                    continue  # orphaned — parent session gone
+                            except Exception:
+                                pass
+                            agents.append(s)
                         self._brain_agents = agents
 
-                    # Advance spinner frame for working agents
-                    has_working = any(
-                        getattr(a, 'status', '') == 'working'
+                    # Advance spinner frame for active agents
+                    has_active = len(self._brain_agents) > 0 and any(
+                        getattr(a, 'status', '') in ('working', 'idle')
                         for a in self._brain_agents
                     )
-                    if has_working or db_poll_counter % 8 == 0:
+                    if has_active or db_poll_counter % 8 == 0:
                         self._brain_spinner_frame = spinner_tick % len(self._SPINNER_FRAMES)
                         spinner_tick += 1
                         try:
@@ -6955,9 +6970,21 @@ class HermesCLI:
             status = getattr(agent, 'status', 'idle')
             name = getattr(agent, 'name', '?')
             progress = getattr(agent, 'progress', '') or ''
-            age = getattr(agent, 'heartbeat_age_seconds', 0)
-            is_stale = getattr(agent, 'is_stale', False)
             is_last = (i == len(agents) - 1)
+
+            # Compute age from last_heartbeat
+            age = 0
+            try:
+                from datetime import datetime, timezone
+                hb = getattr(agent, 'last_heartbeat', None)
+                if hb:
+                    hb_dt = datetime.fromisoformat(hb.replace('Z', '+00:00')) if '+' in hb or 'Z' in hb else datetime.strptime(hb, '%Y-%m-%d %H:%M:%S')
+                    age = int((datetime.utcnow() - hb_dt).total_seconds())
+                    if age < 0:
+                        age = 0
+            except Exception:
+                pass
+            is_stale = age > 60
 
             # Tree-line prefix: ├─ for middle items, └─ for last
             tree = '\u2514\u2500' if is_last else '\u251c\u2500'
