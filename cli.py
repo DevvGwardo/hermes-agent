@@ -6954,6 +6954,9 @@ class HermesCLI:
                                     continue
                             except Exception:
                                 continue
+                            # Hide finished agents (done/failed) — only show active work
+                            if s.status in ('done', 'failed'):
+                                continue
                             agents.append(s)
                         self._brain_agents = agents
 
