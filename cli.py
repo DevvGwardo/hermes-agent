@@ -6954,20 +6954,15 @@ class HermesCLI:
                                     continue
                             except Exception:
                                 continue
-                            # Hide finished/stale agents — only show active work
+                            # Hide finished agents
                             if s.status in ('done', 'failed'):
                                 continue
-                            # Compute heartbeat age — hide if stale (>90s no heartbeat)
-                            try:
-                                from datetime import datetime
-                                hb = getattr(s, 'last_heartbeat', None)
-                                if hb:
-                                    hb_dt = datetime.strptime(hb, '%Y-%m-%d %H:%M:%S')
-                                    hb_age = (datetime.utcnow() - hb_dt).total_seconds()
-                                    if hb_age > 90:
-                                        continue
-                            except Exception:
-                                pass
+                            # Check if process is still alive — drop immediately if dead
+                            if s.pid:
+                                try:
+                                    os.kill(s.pid, 0)  # signal 0 = existence check
+                                except OSError:
+                                    continue  # process dead — drop it
                             agents.append(s)
                         self._brain_agents = agents
 
