@@ -6947,19 +6947,20 @@ class HermesCLI:
 
         fragments = []
         border = 'class:agent-panel-border'
+        prefix = 'class:agent-tree-line'
         frame_idx = getattr(self, '_brain_spinner_frame', 0)
         spinner_char = self._SPINNER_FRAMES[frame_idx % len(self._SPINNER_FRAMES)]
 
-        # Top border
-        fragments.append((border, ' \u2500\u2500 Brain Agents '))
-        fragments.append((border, '\u2500' * 30 + '\n'))
-
-        for agent in agents:
+        for i, agent in enumerate(agents):
             status = getattr(agent, 'status', 'idle')
             name = getattr(agent, 'name', '?')
             progress = getattr(agent, 'progress', '') or ''
             age = getattr(agent, 'heartbeat_age_seconds', 0)
             is_stale = getattr(agent, 'is_stale', False)
+            is_last = (i == len(agents) - 1)
+
+            # Tree-line prefix: ├─ for middle items, └─ for last
+            tree = '\u2514\u2500' if is_last else '\u251c\u2500'
 
             # Status indicator — animated spinner for working agents
             if is_stale:
@@ -6997,13 +6998,11 @@ class HermesCLI:
             # Truncate progress to fit
             prog_display = progress[:22]
 
-            fragments.append((style, f'  {indicator} '))
+            fragments.append((prefix, f'  {tree}'))
+            fragments.append((style, f' {indicator} '))
             fragments.append((name_style, f'{name:<18s}'))
             fragments.append(('class:agent-progress', f'{prog_display:<22s} '))
             fragments.append(('class:agent-duration', f'{duration}\n'))
-
-        # Bottom border
-        fragments.append((border, ' ' + '\u2500' * 46 + '\n'))
 
         return fragments
 
@@ -7064,12 +7063,12 @@ class HermesCLI:
             approval_widget,
             clarify_widget,
             spinner_widget,
+            spacer,
+            *self._get_extra_tui_widgets(),
         ]
         if brain_agent_widget is not None:
             children.append(brain_agent_widget)
         children.extend([
-            spacer,
-            *self._get_extra_tui_widgets(),
             status_bar,
             input_rule_top,
             image_bar,
@@ -8211,6 +8210,7 @@ class HermesCLI:
             'agent-stale': '#4B5563 italic',
             'agent-waiting': '#F59E0B',
             'agent-name': '#E5E7EB',
+            'agent-tree-line': '#4B5563',
             'agent-progress': '#9CA3AF',
             'agent-duration': '#6B7280',
         }
