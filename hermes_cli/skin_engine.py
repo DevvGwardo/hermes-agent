@@ -638,6 +638,25 @@ def init_skin_from_config(config: dict) -> None:
     else:
         set_active_skin("default")
 
+    # Merge any tool_emojis overrides from display config into the active skin
+    display_emojis = display.get("tool_emojis")
+    if display_emojis and isinstance(display_emojis, dict):
+        global _active_skin
+        if _active_skin is not None:
+            merged = dict(_active_skin.tool_emojis)
+            merged.update(display_emojis)
+            _active_skin = SkinConfig(
+                name=_active_skin.name,
+                description=_active_skin.description,
+                colors=_active_skin.colors,
+                spinner=_active_skin.spinner,
+                branding=_active_skin.branding,
+                tool_prefix=_active_skin.tool_prefix,
+                tool_emojis=merged,
+                banner_logo=_active_skin.banner_logo,
+                banner_hero=_active_skin.banner_hero,
+            )
+
 
 # =============================================================================
 # Convenience helpers for CLI modules
