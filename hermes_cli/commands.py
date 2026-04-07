@@ -383,12 +383,12 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     # directly, but don't clutter the Telegram menu.
     try:
         from agent.skill_commands import get_skill_commands
-        from tools.skills_tool import SKILLS_DIR
-        # Built-in skills are synced to SKILLS_DIR (~/.hermes/skills/).
-        # Hub-installed skills go into SKILLS_DIR/.hub/.  Exclude .hub/ skills
+        from tools.skills_tool import _get_skills_dir
+        # Built-in skills are synced to _get_skills_dir() (~/.hermes/skills/).
+        # Hub-installed skills go into _get_skills_dir()/.hub/.  Exclude .hub/ skills
         # from the menu — they're user-installed, not repo built-in.
-        _skills_dir = str(SKILLS_DIR.resolve())
-        _hub_dir = str((SKILLS_DIR / ".hub").resolve())
+        _skills_dir = str(_get_skills_dir().resolve())
+        _hub_dir = str((_get_skills_dir() / ".hub").resolve())
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]

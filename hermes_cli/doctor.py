@@ -13,7 +13,6 @@ from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_constants import display_hermes_home
 
 PROJECT_ROOT = get_project_root()
-HERMES_HOME = get_hermes_home()
 _DHH = display_hermes_home()  # user-facing display path (e.g. ~/.hermes or ~/.hermes/profiles/coder)
 
 # Load environment variables from ~/.hermes/.env so API key checks work
@@ -209,7 +208,7 @@ def run_doctor(args):
     print(color("◆ Configuration Files", Colors.CYAN, Colors.BOLD))
     
     # Check ~/.hermes/.env (primary location for user config)
-    env_path = HERMES_HOME / '.env'
+    env_path = get_hermes_home() / '.env'
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
         
@@ -238,7 +237,7 @@ def run_doctor(args):
                 issues.append("Run 'hermes setup' to create .env")
     
     # Check ~/.hermes/config.yaml (primary) or project cli-config.yaml (fallback)
-    config_path = HERMES_HOME / 'config.yaml'
+    config_path = get_hermes_home() / 'config.yaml'
     if config_path.exists():
         check_ok(f"{_DHH}/config.yaml exists")
     else:
@@ -294,7 +293,7 @@ def run_doctor(args):
     print()
     print(color("◆ Directory Structure", Colors.CYAN, Colors.BOLD))
     
-    hermes_home = HERMES_HOME
+    hermes_home = get_hermes_home()
     if hermes_home.exists():
         check_ok(f"{_DHH} directory exists")
     else:
@@ -676,7 +675,7 @@ def run_doctor(args):
     print()
     print(color("◆ Skills Hub", Colors.CYAN, Colors.BOLD))
 
-    hub_dir = HERMES_HOME / "skills" / ".hub"
+    hub_dir = get_hermes_home() / "skills" / ".hub"
     if hub_dir.exists():
         check_ok("Skills Hub directory exists")
         lock_file = hub_dir / "lock.json"

@@ -430,8 +430,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         append_audit_log("BLOCKED", bundle.name, bundle.source,
                          bundle.trust_level, "invalid_path", str(exc))
         return
-    from tools.skills_hub import SKILLS_DIR
-    c.print(f"[bold green]Installed:[/] {install_dir.relative_to(SKILLS_DIR)}")
+    from tools.skills_hub import _get_skills_dir
+    c.print(f"[bold green]Installed:[/] {install_dir.relative_to(_get_skills_dir())}")
     c.print(f"[dim]Files: {', '.join(bundle.files.keys())}[/]\n")
 
     if invalidate_cache:
@@ -599,7 +599,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
 
 def do_audit(name: Optional[str] = None, console: Optional[Console] = None) -> None:
     """Re-run security scan on installed hub skills."""
-    from tools.skills_hub import HubLockFile, SKILLS_DIR
+    from tools.skills_hub import HubLockFile, _get_skills_dir
     from tools.skills_guard import scan_skill, format_scan_report
 
     c = console or _console
@@ -620,7 +620,7 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None) -> N
     c.print(f"\n[bold]Auditing {len(targets)} skill(s)...[/]\n")
 
     for entry in targets:
-        skill_path = SKILLS_DIR / entry["install_path"]
+        skill_path = _get_skills_dir() / entry["install_path"]
         if not skill_path.exists():
             c.print(f"[yellow]Warning:[/] {entry['name']} — path missing: {entry['install_path']}")
             continue
@@ -711,7 +711,7 @@ def do_tap(action: str, repo: str = "", console: Optional[Console] = None) -> No
 def do_publish(skill_path: str, target: str = "github", repo: str = "",
                console: Optional[Console] = None) -> None:
     """Publish a local skill to a registry (GitHub PR or ClawHub submission)."""
-    from tools.skills_hub import GitHubAuth, SKILLS_DIR
+    from tools.skills_hub import GitHubAuth, _get_skills_dir
     from tools.skills_guard import scan_skill, format_scan_report
 
     c = console or _console
@@ -719,7 +719,7 @@ def do_publish(skill_path: str, target: str = "github", repo: str = "",
 
     # Resolve relative to skills dir if not absolute
     if not path.is_absolute():
-        path = SKILLS_DIR / path
+        path = _get_skills_dir() / path
     if not path.exists() or not (path / "SKILL.md").exists():
         c.print(f"[bold red]Error:[/] No SKILL.md found at {path}\n")
         return
