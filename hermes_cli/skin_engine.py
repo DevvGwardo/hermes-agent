@@ -630,6 +630,9 @@ def init_skin_from_config(config: dict) -> None:
     """Initialize the active skin from CLI config at startup.
 
     Call this once during CLI init with the loaded config dict.
+    Merges ``display.tool_emojis`` from config.yaml into the active
+    skin so users can define emojis in config without a custom skin file.
+    Config values take precedence over the skin file.
     """
     display = config.get("display", {})
     skin_name = display.get("skin", "default")
@@ -637,6 +640,13 @@ def init_skin_from_config(config: dict) -> None:
         set_active_skin(skin_name.strip())
     else:
         set_active_skin("default")
+
+    # Merge display.tool_emojis from config into the active skin.
+    # Config emojis override skin-file emojis (user intent wins).
+    config_emojis = display.get("tool_emojis")
+    if config_emojis and isinstance(config_emojis, dict):
+        skin = get_active_skin()
+        skin.tool_emojis.update(config_emojis)
 
 
 # =============================================================================
