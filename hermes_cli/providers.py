@@ -122,6 +122,10 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         is_aggregator=True,
         base_url_env_var="HF_BASE_URL",
     ),
+    "nvidia": HermesOverlay(
+        transport="openai_chat",
+        base_url_env_var="NVIDIA_BASE_URL",
+    ),
 }
 
 
@@ -387,6 +391,7 @@ LABELS: Dict[str, str] = {
     "kilo": "Kilo Gateway",
     "huggingface": "Hugging Face",
     "local": "Local endpoint",
+    "nvidia": "NVIDIA NIM",
     "custom": "Custom endpoint",
     # Legacy Hermes IDs (point to same providers)
     "ai-gateway": "Vercel AI Gateway",

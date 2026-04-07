@@ -86,6 +86,7 @@ _PASSTHROUGH_PROVIDERS: frozenset[str] = frozenset({
     "alibaba",
     "huggingface",
     "openai-codex",
+    "nvidia",
     "custom",
 })
 
