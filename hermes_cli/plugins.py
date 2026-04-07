@@ -177,8 +177,11 @@ class PluginContext:
         msg = content if role == "user" else f"[{role}] {content}"
 
         if getattr(cli, "_agent_running", False):
-            # Agent is mid-turn — interrupt with the message
-            cli._interrupt_queue.put(msg)
+            # Respect busy_input_mode: queue mode defers, interrupt mode interrupts
+            if getattr(cli, "busy_input_mode", "interrupt") == "queue":
+                cli._pending_input.put(msg)
+            else:
+                cli._interrupt_queue.put(msg)
         else:
             # Agent is idle — queue as next input
             cli._pending_input.put(msg)
