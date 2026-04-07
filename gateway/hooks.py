@@ -28,7 +28,9 @@ import yaml
 from hermes_cli.config import get_hermes_home
 
 
-HOOKS_DIR = get_hermes_home() / "hooks"
+def get_hooks_dir():
+    """Return the hooks directory, resolved at call time for profile isolation."""
+    return get_hermes_home() / "hooks"
 
 
 class HookRegistry:
@@ -78,10 +80,10 @@ class HookRegistry:
         """
         self._register_builtin_hooks()
 
-        if not HOOKS_DIR.exists():
+        if not get_hooks_dir().exists():
             return
 
-        for hook_dir in sorted(HOOKS_DIR.iterdir()):
+        for hook_dir in sorted(get_hooks_dir().iterdir()):
             if not hook_dir.is_dir():
                 continue
 

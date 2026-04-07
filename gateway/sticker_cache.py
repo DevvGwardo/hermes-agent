@@ -15,7 +15,9 @@ from typing import Optional
 from hermes_cli.config import get_hermes_home
 
 
-CACHE_PATH = get_hermes_home() / "sticker_cache.json"
+def get_cache_path():
+    """Return the sticker cache path, resolved at call time for profile isolation."""
+    return get_hermes_home() / "sticker_cache.json"
 
 # Vision prompt for describing stickers -- kept concise to save tokens
 STICKER_VISION_PROMPT = (
@@ -26,9 +28,9 @@ STICKER_VISION_PROMPT = (
 
 def _load_cache() -> dict:
     """Load the sticker cache from disk."""
-    if CACHE_PATH.exists():
+    if get_cache_path().exists():
         try:
-            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+            return json.loads(get_cache_path().read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
@@ -36,8 +38,8 @@ def _load_cache() -> dict:
 
 def _save_cache(cache: dict) -> None:
     """Save the sticker cache to disk."""
-    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_PATH.write_text(
+    get_cache_path().parent.mkdir(parents=True, exist_ok=True)
+    get_cache_path().write_text(
         json.dumps(cache, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )

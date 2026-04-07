@@ -154,14 +154,6 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
-COMPUTER_USE_GUIDANCE = (
-    "When the computer tool returns a screenshot, examine it carefully before "
-    "deciding on the next action. Use mouse_move to position the cursor, then "
-    "verify positioning with another screenshot before clicking. For typing, use "
-    "the type action with the exact text needed. Take screenshots after each "
-    "action to confirm the result."
-)
-
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "

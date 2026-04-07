@@ -439,6 +439,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+        # Bot-to-bot conversation limiter: tracks exchange count per channel.
+        # Resets when a human message arrives. Configurable via DISCORD_BOT_MAX_TURNS (default: 10).
+        self._bot_exchange_counts: Dict[str, int] = {}  # channel_id -> count
+        self._bot_done_channels: set = set()  # channels where [DONE] was seen
+        self._bot_turn_overrides: Dict[str, int] = {}  # channel_id -> per-channel turn limit from human prompt
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -539,6 +544,12 @@ class DiscordAdapter(BasePlatformAdapter):
             
             @self._client.event
             async def on_message(message: DiscordMessage):
+                # Debug: log all incoming messages to trace bot-to-bot delivery
+                _is_bot = getattr(message.author, "bot", False)
+                if _is_bot:
+                    logger.info("[%s] on_message from bot %s (%s) in channel %s: %s",
+                                adapter_self.name, message.author.name, message.author.id,
+                                message.channel.id, message.content[:80] if message.content else "(empty)")
                 # Always ignore our own messages
                 if message.author == self._client.user:
                     return
@@ -560,7 +571,52 @@ class DiscordAdapter(BasePlatformAdapter):
                         if not self._client.user or self._client.user not in message.mentions:
                             return
                     # "all" falls through to handle_message
-                
+
+                    # Bot-to-bot turn limiter: hard-stop after N exchanges per channel.
+                    # Resets when a human sends a message in the same channel.
+                    _chan_id = str(message.channel.id)
+                    # Check for [DONE] signal — permanently block further bot exchanges
+                    if "[DONE]" in message.content:
+                        adapter_self._bot_done_channels.add(_chan_id)
+                        logger.info("[%s] Bot-to-bot [DONE] signal in channel %s, blocking further bot exchanges", adapter_self.name, _chan_id)
+                        return
+                    # If channel is marked done, drop all bot messages
+                    if _chan_id in adapter_self._bot_done_channels:
+                        return
+                    # Increment and check turn limit (per-channel override or global default)
+                    _default_max = int(os.getenv("DISCORD_BOT_MAX_TURNS", "10"))
+                    _max_turns = adapter_self._bot_turn_overrides.get(_chan_id, _default_max)
+                    adapter_self._bot_exchange_counts[_chan_id] = adapter_self._bot_exchange_counts.get(_chan_id, 0) + 1
+                    if adapter_self._bot_exchange_counts[_chan_id] > _max_turns:
+                        logger.info("[%s] Bot-to-bot turn limit (%d) reached in channel %s, ignoring", adapter_self.name, _max_turns, _chan_id)
+                        return
+                else:
+                    # Human message: reset bot exchange counters for this channel
+                    _chan_id = str(message.channel.id)
+                    adapter_self._bot_exchange_counts.pop(_chan_id, None)
+                    adapter_self._bot_done_channels.discard(_chan_id)
+                    adapter_self._bot_turn_overrides.pop(_chan_id, None)
+                    # Parse the human's message for turn/round budget hints.
+                    # Patterns: "3 rounds each", "5 rounds", "4 exchanges", "6 turns",
+                    #           "back and forth 3 times", "3 back and forth"
+                    _text = message.content.lower()
+                    _m = re.search(r'(\d+)\s+rounds?\s+each', _text)
+                    if _m:
+                        # "3 rounds each" = 3 per bot = 6 total exchanges
+                        adapter_self._bot_turn_overrides[_chan_id] = int(_m.group(1)) * 2
+                    else:
+                        _m = re.search(r'(\d+)\s+(?:rounds?|exchanges?|back\s+and\s+forth)', _text)
+                        if not _m:
+                            _m = re.search(r'back\s+and\s+forth\s+(\d+)', _text)
+                        if not _m:
+                            _m = re.search(r'(\d+)\s+turns?\s+each', _text)
+                            if _m:
+                                adapter_self._bot_turn_overrides[_chan_id] = int(_m.group(1)) * 2
+                        if _m and _chan_id not in adapter_self._bot_turn_overrides:
+                            adapter_self._bot_turn_overrides[_chan_id] = int(_m.group(1)) * 2
+                    if _chan_id in adapter_self._bot_turn_overrides:
+                        logger.info("[%s] Bot-to-bot turn limit set to %d for channel %s from human prompt", adapter_self.name, adapter_self._bot_turn_overrides[_chan_id], _chan_id)
+
                 # If the message @mentions other users but NOT the bot, the
                 # sender is talking to someone else — stay silent.  Only
                 # applies in server channels; in DMs the user is always

@@ -18,8 +18,13 @@ from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
-_SESSIONS_DIR = get_hermes_home() / "sessions"
-_SESSIONS_INDEX = _SESSIONS_DIR / "sessions.json"
+def _get_sessions_dir():
+    """Return the sessions directory, resolved at call time for profile isolation."""
+    return get_hermes_home() / "sessions"
+
+def _get_sessions_index():
+    """Return the sessions index path, resolved at call time for profile isolation."""
+    return _get_sessions_dir() / "sessions.json"
 
 
 def mirror_to_session(
@@ -71,11 +76,11 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
     on the right platform.  DM session keys don't embed the chat_id
     (e.g. "agent:main:telegram:dm"), so we check the origin dict.
     """
-    if not _SESSIONS_INDEX.exists():
+    if not _get_sessions_index().exists():
         return None
 
     try:
-        with open(_SESSIONS_INDEX, encoding="utf-8") as f:
+        with open(_get_sessions_index(), encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return None
@@ -106,7 +111,7 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
 
 def _append_to_jsonl(session_id: str, message: dict) -> None:
     """Append a message to the JSONL transcript file."""
-    transcript_path = _SESSIONS_DIR / f"{session_id}.jsonl"
+    transcript_path = _get_sessions_dir() / f"{session_id}.jsonl"
     try:
         with open(transcript_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")

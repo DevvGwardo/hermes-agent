@@ -310,11 +310,11 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     # Normalize: command uses hyphens, skill names may use hyphens or underscores
     normalized = command_name.lower().replace("_", "-")
     try:
-        from tools.skills_tool import SKILLS_DIR, _get_disabled_skill_names
+        from tools.skills_tool import _get_skills_dir, _get_disabled_skill_names
         disabled = _get_disabled_skill_names()
 
         # Check disabled built-in skills
-        for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+        for skill_md in _get_skills_dir().rglob("SKILL.md"):
             if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
                 continue
             name = skill_md.parent.name.lower().replace("_", "-")
@@ -482,7 +482,14 @@ class GatewayRunner:
             ensure_installed(log_failures=False)
         except Exception:
             pass  # Non-fatal — fail-open at scan time if unavailable
-        
+
+        # Load permanent command allowlist so /approve always persists across restarts
+        try:
+            from tools.approval import load_permanent_allowlist
+            load_permanent_allowlist()
+        except Exception:
+            pass  # Non-fatal — approval system works without it
+
         # Initialize session database for session_search tool support
         self._session_db = None
         try:
@@ -677,12 +684,12 @@ class GatewayRunner:
             # what's already saved and avoid overwriting newer entries.
             _current_memory = ""
             try:
-                from tools.memory_tool import MEMORY_DIR
+                from tools.memory_tool import get_memory_dir
                 for fname, label in [
                     ("MEMORY.md", "MEMORY (your personal notes)"),
                     ("USER.md", "USER PROFILE (who the user is)"),
                 ]:
-                    fpath = MEMORY_DIR / fname
+                    fpath = get_memory_dir() / fname
                     if fpath.exists():
                         content = fpath.read_text(encoding="utf-8").strip()
                         if content:
@@ -4571,11 +4578,12 @@ class GatewayRunner:
 
         # Determine approval scope from args
         args = event.get_command_args().strip().lower()
-        from tools.approval import approve_session, approve_permanent
+        from tools.approval import approve_session, approve_permanent, save_permanent_allowlist, _permanent_approved
 
         if args in ("always", "permanent", "permanently"):
             for pk in pattern_keys:
                 approve_permanent(pk)
+            save_permanent_allowlist(_permanent_approved)
             scope_msg = " (pattern approved permanently)"
         elif args in ("session", "ses"):
             for pk in pattern_keys:
