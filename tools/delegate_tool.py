@@ -37,7 +37,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
 MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
-DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+DEFAULT_TOOLSETS = ["terminal", "file", "web", "todo"]
 
 
 def check_delegate_requirements() -> bool:
@@ -253,6 +253,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    initial_todos: Optional[List[Dict[str, Any]]] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -260,6 +261,13 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+
+    # Pre-populate child's todo store before conversation starts
+    if initial_todos and isinstance(initial_todos, list):
+        try:
+            child._todo_store.write(initial_todos, merge=False)
+        except Exception as e:
+            logger.debug("[subagent-%d] Failed to write initial_todos: %s", task_index, e)
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
@@ -286,6 +294,19 @@ def _run_single_child(
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
+
+        # Append todo summary so parent has visibility into task tracking
+        try:
+            child_todos = child._todo_store.read()
+            if child_todos:
+                markers = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]", "cancelled": "[~]"}
+                todo_lines = ["\n\n--- Task Tracker ---"]
+                for item in child_todos:
+                    m = markers.get(item["status"], "[?]")
+                    todo_lines.append(f"  {m} {item['id']}. {item['content']}")
+                summary += "\n".join(todo_lines)
+        except Exception:
+            pass  # never block result on todo summary failure
 
         if interrupted:
             status = "interrupted"
@@ -406,14 +427,15 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    initial_todos: Optional[List[Dict[str, Any]]] = None,
     parent_agent=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets)
-      - Batch:  provide tasks array [{goal, context, toolsets}, ...]
+      - Single: provide goal (+ optional context, toolsets, initial_todos)
+      - Batch:  provide tasks array [{goal, context, toolsets, initial_todos}, ...]
 
     Returns JSON with results array, one entry per task.
     """
@@ -449,7 +471,7 @@ def delegate_task(
     if tasks and isinstance(tasks, list):
         task_list = tasks[:MAX_CONCURRENT_CHILDREN]
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        task_list = [{"goal": goal, "context": context, "toolsets": toolsets, "initial_todos": initial_todos}]
     else:
         return json.dumps({"error": "Provide either 'goal' (single task) or 'tasks' (batch)."})
 
@@ -498,7 +520,8 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(0, _t["goal"], child, parent_agent,
+                                   initial_todos=_t.get("initial_todos"))
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -514,6 +537,7 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    initial_todos=t.get("initial_todos"),
                 )
                 futures[future] = i
 
@@ -708,6 +732,9 @@ DELEGATE_TASK_SCHEMA = {
         "- Subagents CANNOT call: delegate_task, clarify, memory, send_message, "
         "execute_code.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
+        "- Subagents have the todo tool by default for task tracking. Use 'initial_todos' "
+        "to pre-populate their task list.\n"
+        "- If the subagent used the todo tool, its task tracker summary is appended to the result.\n"
         "- Results are always returned as an array, one entry per task."
     ),
     "parameters": {
@@ -752,6 +779,22 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Toolsets for this specific task",
                         },
+                        "initial_todos": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "content": {"type": "string"},
+                                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]},
+                                },
+                                "required": ["id", "content", "status"],
+                            },
+                            "description": (
+                                "Pre-populate the subagent's todo list before the conversation starts. "
+                                "Each item needs id, content, and status."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -769,6 +812,23 @@ DELEGATE_TASK_SCHEMA = {
                     "Only set lower for simple tasks."
                 ),
             },
+            "initial_todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "content": {"type": "string"},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]},
+                    },
+                    "required": ["id", "content", "status"],
+                },
+                "description": (
+                    "Pre-populate the subagent's todo list before the conversation starts. "
+                    "Each item needs id, content, and status. "
+                    "Ignored when 'tasks' (batch mode) is provided."
+                ),
+            },
         },
         "required": [],
     },
@@ -782,11 +842,12 @@ registry.register(
     name="delegate_task",
     toolset="delegation",
     schema=DELEGATE_TASK_SCHEMA,
-    handler=lambda args, **kw: delegate_task(
-        goal=args.get("goal"),
-        context=args.get("context"),
-        toolsets=args.get("toolsets"),
-        tasks=args.get("tasks"),
+handler=lambda args, **kw: delegate_task(
+    goal=args.get("goal"),
+    context=args.get("context"),
+    toolsets=args.get("toolsets"),
+    tasks=args.get("tasks"),
+    initial_todos=args.get("initial_todos"),
         max_iterations=args.get("max_iterations"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
