@@ -62,7 +62,7 @@ class TestFormatForInjection:
 
 class TestMergeMode:
     def test_update_existing_by_id(self):
-        store = TodoStore()
+        store = TodoStore(auto_clear=False)
         store.write([
             {"id": "1", "content": "Original", "status": "pending"},
         ])
