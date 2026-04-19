@@ -2123,6 +2123,7 @@ class HermesCLI:
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
                 pass_session_id=self.pass_session_id,
                 tool_progress_callback=self._on_tool_progress,
+                tool_complete_callback=self._on_tool_complete,
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
             )
@@ -4858,6 +4859,30 @@ class HermesCLI:
             ).start()
         except Exception:
             pass
+
+    def _on_tool_complete(
+        self,
+        tool_call_id: str,
+        function_name: str,
+        function_args: dict | None,
+        function_result: str,
+    ):
+        """Render terminal-friendly structured tool results when helpful."""
+        if function_name != "todo":
+            return
+
+        try:
+            from tools.todo_tool import todo_cli_from_result
+
+            cli_text = todo_cli_from_result(function_result)
+        except Exception:
+            return
+
+        if not cli_text:
+            return
+
+        _cprint(cli_text)
+        self._invalidate()
 
     # ====================================================================
     # Voice mode methods

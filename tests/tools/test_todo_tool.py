@@ -2,7 +2,7 @@
 
 import json
 
-from tools.todo_tool import TodoStore, todo_tool
+from tools.todo_tool import TodoStore, todo_cli_from_result, todo_tool
 
 
 class TestWriteAndRead:
@@ -105,3 +105,18 @@ class TestTodoToolFunction:
     def test_no_store_returns_error(self):
         result = json.loads(todo_tool())
         assert "error" in result
+
+    def test_prompt_auto_launches_and_exposes_cli_text(self):
+        store = TodoStore()
+        result = todo_tool(
+            prompt="Update the README and tests",
+            store=store,
+        )
+        payload = json.loads(result)
+        assert payload["prompt_analysis"]["launched"] is True
+        assert payload["summary"]["total"] == 2
+        assert "HERMES TODO" in payload["cli"]
+
+        cli_text = todo_cli_from_result(result)
+        assert cli_text is not None
+        assert "[>]" in cli_text

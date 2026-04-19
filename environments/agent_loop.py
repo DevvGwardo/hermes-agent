@@ -381,6 +381,8 @@ class HermesAgentLoop:
                                 if tool_name == "todo":
                                     tool_result = _todo_tool(
                                         todos=args.get("todos"),
+                                        prompt=args.get("prompt"),
+                                        min_tasks=args.get("min_tasks", 2),
                                         merge=args.get("merge", False),
                                         store=_todo_store,
                                     )
