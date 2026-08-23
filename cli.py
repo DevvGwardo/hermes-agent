@@ -5589,6 +5589,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # resize fires.
         self._last_resize_width = None
 
+        # Brain agent panel state
+        self._brain_agents: list = []
+        self._brain_agents_poll_thread: Optional[threading.Thread] = None
+        self._brain_agents_shutting_down = False
+        self._brain_spinner_frame: int = 0
+
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
@@ -17266,6 +17272,123 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._invalidate(min_interval=0.0)
         return True
 
+    # --- Brain agent panel ---------------------------------------------------
+
+    _SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+    def _start_brain_agent_poll(self) -> None:
+        """Start a daemon thread that polls brain.db for active agents."""
+        if self._brain_agents_poll_thread is not None:
+            return
+
+        def _poll():
+            from agent.display import get_active_brain_agents
+            spinner_tick = 0
+            tick = 0
+            while not self._brain_agents_shutting_down:
+                try:
+                    # DB poll every ~2s (16 ticks * 0.12s), spinner every tick
+                    if tick % 16 == 0:
+                        self._brain_agents = get_active_brain_agents()
+
+                    # Animate spinner if any agents are showing
+                    if self._brain_agents:
+                        self._brain_spinner_frame = spinner_tick % len(self._SPINNER_FRAMES)
+                        spinner_tick += 1
+                        try:
+                            self._invalidate(min_interval=0.0)
+                        except Exception:
+                            pass
+
+                    tick += 1
+                except Exception:
+                    tick += 1
+                import time; time.sleep(0.12)
+
+        self._brain_agents_poll_thread = threading.Thread(
+            target=_poll, daemon=True, name="brain-agent-poll"
+        )
+        self._brain_agents_poll_thread.start()
+
+    def _render_brain_agent_panel(self) -> list:
+        """Return prompt_toolkit fragments for the brain agent status panel."""
+        agents = self._brain_agents
+        if not agents:
+            return []
+
+        fragments = []
+        border = 'class:agent-panel-border'
+        prefix = 'class:agent-tree-line'
+        frame_idx = getattr(self, '_brain_spinner_frame', 0)
+        spinner_char = self._SPINNER_FRAMES[frame_idx % len(self._SPINNER_FRAMES)]
+
+        for i, agent in enumerate(agents):
+            status = getattr(agent, 'status', 'idle')
+            name = getattr(agent, 'name', '?')
+            progress = getattr(agent, 'progress', '') or ''
+            is_last = (i == len(agents) - 1)
+
+            # Compute age from last_heartbeat
+            age = 0
+            try:
+                from datetime import datetime, timezone
+                hb = getattr(agent, 'last_heartbeat', None)
+                if hb:
+                    hb_dt = datetime.fromisoformat(hb.replace('Z', '+00:00')) if '+' in hb or 'Z' in hb else datetime.strptime(hb, '%Y-%m-%d %H:%M:%S')
+                    age = int((datetime.utcnow() - hb_dt).total_seconds())
+                    if age < 0:
+                        age = 0
+            except Exception:
+                pass
+            is_stale = age > 60
+
+            # Tree-line prefix: ├─ for middle items, └─ for last
+            tree = '\u2514\u2500' if is_last else '\u251c\u2500'
+
+            # Status indicator — animated spinner for working agents
+            if is_stale:
+                indicator = '\u25cc'  # ◌
+                style = 'class:agent-stale'
+            elif status == 'done':
+                indicator = '\u2713'  # ✓
+                style = 'class:agent-done'
+            elif status == 'failed':
+                indicator = '\u2717'  # ✗
+                style = 'class:agent-failed'
+            elif status == 'working':
+                indicator = spinner_char  # ⠋⠙⠹... animated
+                style = 'class:agent-working'
+            else:
+                indicator = '\u25cb'  # ○
+                style = 'class:agent-waiting'
+
+            # Try to get agent color from metadata
+            name_style = 'class:agent-name'
+            try:
+                metadata = getattr(agent, 'metadata', None)
+                if metadata:
+                    import json as _json
+                    meta = _json.loads(metadata) if isinstance(metadata, str) else metadata
+                    color = meta.get('color')
+                    if color:
+                        name_style = color
+            except Exception:
+                pass
+
+            # Duration
+            duration = f"{age}s" if age < 60 else f"{age // 60}m{age % 60}s"
+
+            # Truncate progress to fit
+            prog_display = progress[:22]
+
+            fragments.append((prefix, f'  {tree}'))
+            fragments.append((style, f' {indicator} '))
+            fragments.append((name_style, f'{name:<18s}'))
+            fragments.append(('class:agent-progress', f'{prog_display:<22s} '))
+            fragments.append(('class:agent-duration', f'{duration}\n'))
+
+        return fragments
+
     # --- Protected TUI extension hooks for wrapper CLIs ---
 
     def _get_extra_tui_widgets(self) -> list:
@@ -17303,6 +17426,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         model_picker_widget=None,
         command_palette_widget=None,
         spinner_widget=None,
+        brain_agent_widget=None,
         spacer,
         status_bar,
         input_rule_top,
@@ -17333,6 +17457,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 *self._get_extra_tui_widgets(),
                 getattr(self, "_pet_widget", None),
                 getattr(self, "_stash_panel_widget", None),
+                brain_agent_widget,
                 status_bar,
                 input_rule_top,
                 image_bar,
@@ -19234,6 +19359,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             align=WindowAlign.RIGHT,
         )
 
+        # Brain agent panel — shows active brain-mcp agents with status indicators
+        brain_agent_widget = ConditionalContainer(
+            Window(
+                content=FormattedTextControl(lambda: cli_ref._render_brain_agent_panel()),
+                wrap_lines=False,
+            ),
+            filter=Condition(lambda: len(cli_ref._brain_agents) > 0),
+        )
+
         spacer = Window(
             content=FormattedTextControl(get_hint_text),
             height=get_hint_height,
@@ -19936,6 +20070,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     model_picker_widget=model_picker_widget,
                     command_palette_widget=command_palette_widget,
                     spinner_widget=spinner_widget,
+                    brain_agent_widget=brain_agent_widget,
                     spacer=spacer,
                     status_bar=status_bar,
                     input_rule_top=input_rule_top,
@@ -20005,6 +20140,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'voice-processing': '#FFA500 italic',
             'voice-status': 'bg:#1a1a2e #87CEEB',
             'voice-status-recording': 'bg:#1a1a2e #FF4444 bold',
+            # Brain agent panel
+            'agent-panel-border': '#CD7F32',
+            'agent-working': '#10B981 bold',
+            'agent-done': '#6B7280',
+            'agent-failed': '#EF4444 bold',
+            'agent-stale': '#4B5563 italic',
+            'agent-waiting': '#F59E0B',
+            'agent-name': '#E5E7EB',
+            'agent-tree-line': '#4B5563',
+            'agent-progress': '#9CA3AF',
+            'agent-duration': '#6B7280',
         }
         style = PTStyle.from_dict(self._build_tui_style_dict())
 
@@ -20583,6 +20729,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 _aio_probe.set_event_loop_policy(_SelectEventLoopPolicy())
 
+        # Start brain agent polling thread
+        self._start_brain_agent_poll()
+
         # Run the application with patch_stdout for proper output handling
         try:
             with patch_stdout():
@@ -20634,6 +20783,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         finally:
             self._should_exit = True
             self._pet_stop_anim()
+            self._brain_agents_shutting_down = True
             # Immediate feedback: prompt_toolkit has just torn down the input
             # box + status bar, so without a line here the terminal sits
             # silent for the whole cleanup window (session flush, memory

@@ -1587,3 +1587,98 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
+
+
+# =========================================================================
+# Brain agent panel — shared logic for CLI + gateway
+# =========================================================================
+
+def get_active_brain_agents(room: str = None) -> list:
+    """Query brain.db and return a clean list of active agents.
+
+    Handles ghost session detection, PID liveness, done/failed filtering,
+    and dedup. Returns Session objects. Empty list if brain.db unavailable.
+    """
+    try:
+        _brain_path = str(Path.home() / "brain-mcp")
+        if _brain_path not in sys.path:
+            sys.path.insert(0, _brain_path)
+        from hermes.db import BrainDB
+
+        db_path = os.environ.get("BRAIN_DB_PATH", str(Path.home() / ".claude" / "brain" / "brain.db"))
+        if not os.path.exists(db_path):
+            return []
+
+        db = BrainDB(db_path)
+        sessions = db.get_sessions(room=room or os.getcwd())
+        db.close()
+
+        # Step 1: Identify ghost PIDs.
+        # brain_wake/brain_swarm pre-registers sessions with the MCP server's
+        # PID. These ghosts share that PID. Real agents each have their own
+        # unique PID. Count sessions per PID — any PID with 3+ sessions is
+        # the MCP server, and those sessions are ghosts.
+        from collections import Counter
+        pid_counts = Counter(s.pid for s in sessions if s.pid)
+        ghost_pids = {pid for pid, count in pid_counts.items() if count >= 3}
+
+        agents = []
+        for s in sessions:
+            # Skip hermes itself and lead sessions (session-XXXXX pattern)
+            if s.name == "hermes" or s.name.startswith("session-"):
+                continue
+            # Skip finished
+            if s.status in ('done', 'failed'):
+                continue
+            # Skip ghost sessions (pre-registered by MCP server, never claimed)
+            if s.pid in ghost_pids:
+                continue
+            # Skip dead processes
+            if s.pid:
+                try:
+                    os.kill(s.pid, 0)
+                except OSError:
+                    continue
+            agents.append(s)
+
+        # Deduplicate by name — keep freshest heartbeat
+        by_name = {}
+        for a in agents:
+            existing = by_name.get(a.name)
+            if existing is None:
+                by_name[a.name] = a
+            elif (a.last_heartbeat or '') > (existing.last_heartbeat or ''):
+                by_name[a.name] = a
+        return list(by_name.values())
+
+    except Exception:
+        return []
+
+
+def format_brain_agents_text(agents: list) -> str:
+    """Format brain agents as plain text for Discord/Telegram messages.
+
+    Returns empty string if no agents.
+    """
+    if not agents:
+        return ""
+
+    lines = []
+    for a in agents:
+        status = getattr(a, 'status', 'idle')
+        name = getattr(a, 'name', '?')
+        progress = getattr(a, 'progress', '') or ''
+
+        if status == 'working':
+            icon = '\u25cf'   # ●
+        elif status == 'done':
+            icon = '\u2713'   # ✓
+        elif status == 'failed':
+            icon = '\u2717'   # ✗
+        else:
+            icon = '\u25cb'   # ○
+
+        prog = progress[:28] if progress else status
+        lines.append(f"  {icon} {name}: {prog}")
+
+    return "\u2500 Brain Agents \u2500\n" + "\n".join(lines)

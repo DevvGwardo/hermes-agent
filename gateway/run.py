@@ -4774,6 +4774,20 @@ class TurnRunner:
                         exc_info=True,
                     )
 
+    @staticmethod
+    def _remove_brain_block(lines):
+        """Remove the brain agents status block from accumulated lines."""
+        idx = None
+        for i, line in enumerate(lines):
+            if line.startswith("\u2500 Brain Agents"):
+                idx = i
+                break
+        if idx is not None:
+            end = idx + 1
+            while end < len(lines) and lines[end].startswith("  "):
+                end += 1
+            del lines[idx:end]
+
     async def send_progress_messages(self):
         ctx = self._ctx
         if not ctx.progress_queue:
@@ -4979,6 +4993,16 @@ class TurnRunner:
                     if progress_lines:
                         progress_lines[-1] = f"{base_msg} (×{count + 1})"
                     msg = progress_lines[-1] if progress_lines else base_msg
+                elif isinstance(raw, tuple) and raw[0] == "__brain_agents__":
+                    # Brain agent status block — replace previous block or append
+                    _, block = raw
+                    self._remove_brain_block(progress_lines)
+                    progress_lines.extend(block.split("\n"))
+                    msg = block
+                elif isinstance(raw, tuple) and raw[0] == "__brain_agents_clear__":
+                    # All agents finished — remove the block
+                    self._remove_brain_block(progress_lines)
+                    msg = None
                 elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                     # Content bubble just landed on the platform — close off
                     # the current tool-progress bubble so the next tool
@@ -4996,6 +5020,9 @@ class TurnRunner:
                 else:
                     msg = raw
                     progress_lines.append(msg)
+
+                if msg is None:
+                    continue  # clear event — no message to send
 
                 if await _roll_progress_overflow_if_needed():
                     _last_edit_ts = time.monotonic()
@@ -5116,6 +5143,14 @@ class TurnRunner:
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) >= 1
+                            and isinstance(raw[0], str)
+                            and raw[0].startswith("__brain")
+                        ):
+                            # Stateless markers — nothing to flush on cancel
+                            pass
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
@@ -28868,9 +28903,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # With the old tool_progress-only gate, a thinking_progress:true /
         # tool_progress:off user had the callback queue _thinking messages that
         # no task ever drained — so they silently never appeared.
+        # Brain agent status for gateway — polls brain.db and pushes formatted
+        # status into the progress queue so it shows in Discord/Telegram messages
+        async def poll_brain_agents_for_gateway():
+            if not progress_queue:
+                return
+            from agent.display import get_active_brain_agents, format_brain_agents_text
+            prev_status = ""
+            while True:
+                try:
+                    agents = get_active_brain_agents()
+                    block = format_brain_agents_text(agents)
+                    if block and block != prev_status:
+                        prev_status = block
+                        progress_queue.put(("__brain_agents__", block))
+                    elif not block and prev_status:
+                        # Agents all gone — push empty to clear the block
+                        prev_status = ""
+                        progress_queue.put(("__brain_agents_clear__",))
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+
+        brain_gateway_task = None
+
         progress_task = None
         if needs_progress_queue:
             progress_task = asyncio.create_task(send_progress_messages())
+            brain_gateway_task = asyncio.create_task(poll_brain_agents_for_gateway())
 
         # Start the tool-call log writer when tool_progress == "log".
         log_task = None
@@ -29816,6 +29878,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
                 progress_task.cancel()
+            if brain_gateway_task:
+                brain_gateway_task.cancel()
             if log_task:
                 log_task.cancel()
             interrupt_monitor.cancel()
@@ -29875,7 +29939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks
-            for task in [progress_task, log_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [progress_task, brain_gateway_task, log_task, interrupt_monitor, tracking_task, _notify_task]:
                 if task:
                     try:
                         await task
