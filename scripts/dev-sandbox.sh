@@ -311,6 +311,12 @@ if [ ! -f "$REAL_CA_CERT" ]; then
   exit 1
 fi
 if [ ! -f "$SANDBOX_ROOT/root/certs/real-ca.pem" ]; then
+  # The proxy verifies upstream TLS against the REAL system bundle (proxy.py's
+  # third arg); only /work/certs/ca.pem is the sandbox's own CA. bwrap's
+  # NODE_EXTRA_CA_CERTS must point at ca.pem -- Node's TLS terminates at the
+  # MITM proxy just like curl's and Python's, and pointing it here made npm
+  # reject the proxy's certificates on every install (44 SSLEOF handshakes,
+  # "npm install failed or timed out").
   cp "$REAL_CA_CERT" "$SANDBOX_ROOT/root/certs/real-ca.pem"
 fi
 printf 'nameserver 10.0.2.3\n' > "$SANDBOX_ROOT/etc/resolv.conf"
