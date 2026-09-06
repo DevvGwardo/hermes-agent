@@ -530,6 +530,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        self._skill_entries: list = []
+        self._skill_lookup: dict = {}
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -1891,19 +1893,21 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if user is allowed via DISCORD_ALLOWED_USERS or DISCORD_ALLOWED_ROLES.
 
         Uses OR semantics: if the user matches EITHER allowlist, they're allowed.
-        If both allowlists are empty, everyone is allowed (backwards compatible).
+        If both allowlists are empty, nobody is allowed (fail closed — require
+        explicit allowlist/pairing).
         When author is a Member, checks .roles directly; otherwise falls back
         to scanning the bot's mutual guilds for a Member record.
         """
         # ``getattr`` fallbacks here guard against test fixtures that build
         # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
+        # Fail closed: empty allowlists deny (require explicit allowlist/pairing).
         allowed_users = getattr(self, "_allowed_user_ids", set())
         allowed_roles = getattr(self, "_allowed_role_ids", set())
         has_users = bool(allowed_users)
         has_roles = bool(allowed_roles)
         if not has_users and not has_roles:
-            return True
+            return False
         # Check user ID allowlist
         if has_users and user_id in allowed_users:
             return True
@@ -1940,11 +1944,10 @@ class DiscordAdapter(BasePlatformAdapter):
     # operator. ``_check_slash_authorization`` mirrors the on_message gates
     # one-for-one so the slash surface honors the same trust boundary.
     #
-    # By design, this is a no-op for deployments with no allowlist env vars
-    # set — ``_is_allowed_user`` returns True and the channel checks early-out
-    # — preserving the existing "single-tenant, all guild members trusted"
-    # default. Deployments that DO set any DISCORD_ALLOWED_* var get slash
-    # parity with on_message.
+    # By design, this is fail closed for deployments with no allowlist env
+    # vars set — ``_is_allowed_user`` returns False until an explicit
+    # allowlist/pairing is configured. Deployments that DO set any
+    # DISCORD_ALLOWED_* var get slash parity with on_message.
 
     def _evaluate_slash_authorization(
         self, interaction: "discord.Interaction",

@@ -5183,6 +5183,28 @@ class GatewayRunner:
         if canonical == "background":
             return await self._handle_background_command(event)
 
+        if canonical == "queue":
+            # No active agent — /queue has no turn boundary to attach to,
+            # so the payload runs as a normal user turn right now (mirrors
+            # the idle /steer path below).  The _queued_events helpers
+            # (_enqueue_fifo / _queue_depth) are deliberately NOT used
+            # here: with no running agent there is no slot/overflow to
+            # append to, and staging into adapter._pending_messages would
+            # replay the payload as a duplicate follow-up turn once the
+            # new run drains.  Empty payload surfaces the usage hint.
+            # Inline dispatch on this guard-bypass path — never via
+            # _process_message_background, which races session lifecycle.
+            queue_payload = event.get_command_args().strip()
+            if not queue_payload:
+                return "Usage: /queue <prompt>  (no agent is running; sending as a normal message)"
+            try:
+                event.text = queue_payload
+            except Exception:
+                pass
+            # Do NOT return — fall through to _handle_message_with_agent
+            # at the end of this function so the rewritten text is sent
+            # to the agent as a regular user turn.
+
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
             # Strip the prefix so downstream treats it as a normal user

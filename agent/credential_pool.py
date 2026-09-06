@@ -567,10 +567,7 @@ class CredentialPool:
                     val = state.get(extra_key)
                     if val is not None:
                         extra_updates[extra_key] = val
-                updated = replace(entry, extra=extra_updates, **field_updates)
-                self._replace_entry(entry, updated)
-                self._persist()
-                return updated
+                return replace(entry, extra=extra_updates, **field_updates)
         except Exception as exc:
             logger.debug("Failed to sync Nous entry from auth.json: %s", exc)
         return entry
@@ -798,6 +795,155 @@ class CredentialPool:
         self._sync_device_code_entry_to_auth_store(updated)
         return updated
 
+    def _refresh_entry_deferred(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        """Network/file refresh WITHOUT touching pool state.
+
+        Same refresh logic as :meth:`_refresh_entry` but pure: performs the
+        file reads, network refresh, and auth-store/credentials-file
+        write-backs outside the pool lock, and returns the updated entry
+        WITHOUT calling ``_replace_entry`` / ``_persist`` /
+        ``_mark_exhausted``. The caller applies the result under the pool
+        lock and batches a single persist. Returns ``None`` on failure
+        (caller marks exhausted + persists once).
+        """
+        if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
+            return None
+
+        try:
+            if self.provider == "anthropic":
+                from agent.anthropic_adapter import refresh_anthropic_oauth_pure
+
+                refreshed = refresh_anthropic_oauth_pure(
+                    entry.refresh_token,
+                    use_json=entry.source.endswith("hermes_pkce"),
+                )
+                updated = replace(
+                    entry,
+                    access_token=refreshed["access_token"],
+                    refresh_token=refreshed["refresh_token"],
+                    expires_at_ms=refreshed["expires_at_ms"],
+                )
+                if entry.source == "claude_code":
+                    try:
+                        from agent.anthropic_adapter import _write_claude_code_credentials
+                        _write_claude_code_credentials(
+                            refreshed["access_token"],
+                            refreshed["refresh_token"],
+                            refreshed["expires_at_ms"],
+                        )
+                    except Exception as wexc:
+                        logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
+            elif self.provider == "openai-codex":
+                refreshed = auth_mod.refresh_codex_oauth_pure(
+                    entry.access_token,
+                    entry.refresh_token,
+                )
+                updated = replace(
+                    entry,
+                    access_token=refreshed["access_token"],
+                    refresh_token=refreshed["refresh_token"],
+                    last_refresh=refreshed.get("last_refresh"),
+                )
+            elif self.provider == "nous":
+                synced = self._sync_nous_entry_from_auth_store(entry)
+                if synced is not entry:
+                    entry = synced
+                nous_state = {
+                    "access_token": entry.access_token,
+                    "refresh_token": entry.refresh_token,
+                    "client_id": entry.client_id,
+                    "portal_base_url": entry.portal_base_url,
+                    "inference_base_url": entry.inference_base_url,
+                    "token_type": entry.token_type,
+                    "scope": entry.scope,
+                    "obtained_at": entry.obtained_at,
+                    "expires_at": entry.expires_at,
+                    "agent_key": entry.agent_key,
+                    "agent_key_expires_at": entry.agent_key_expires_at,
+                    "tls": entry.tls,
+                }
+                refreshed = auth_mod.refresh_nous_oauth_from_state(
+                    nous_state,
+                    min_key_ttl_seconds=DEFAULT_AGENT_KEY_MIN_TTL_SECONDS,
+                    force_refresh=force,
+                    force_mint=force,
+                )
+                field_updates = {}
+                extra_updates = dict(entry.extra)
+                _field_names = {f.name for f in fields(entry)}
+                for k, v in refreshed.items():
+                    if k in _field_names:
+                        field_updates[k] = v
+                    elif k in _EXTRA_KEYS:
+                        extra_updates[k] = v
+                updated = replace(entry, extra=extra_updates, **field_updates)
+            else:
+                return entry
+        except Exception as exc:
+            logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            if self.provider == "anthropic" and entry.source == "claude_code":
+                synced = self._sync_anthropic_entry_from_credentials_file(entry)
+                if synced.refresh_token != entry.refresh_token:
+                    logger.debug("Retrying refresh with synced token from credentials file")
+                    try:
+                        from agent.anthropic_adapter import refresh_anthropic_oauth_pure
+                        refreshed = refresh_anthropic_oauth_pure(
+                            synced.refresh_token,
+                            use_json=synced.source.endswith("hermes_pkce"),
+                        )
+                        updated = replace(
+                            synced,
+                            access_token=refreshed["access_token"],
+                            refresh_token=refreshed["refresh_token"],
+                            expires_at_ms=refreshed["expires_at_ms"],
+                            last_status=STATUS_OK,
+                            last_status_at=None,
+                            last_error_code=None,
+                        )
+                        try:
+                            from agent.anthropic_adapter import _write_claude_code_credentials
+                            _write_claude_code_credentials(
+                                refreshed["access_token"],
+                                refreshed["refresh_token"],
+                                refreshed["expires_at_ms"],
+                            )
+                        except Exception as wexc:
+                            logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
+                        return updated
+                    except Exception as retry_exc:
+                        logger.debug("Retry refresh also failed: %s", retry_exc)
+                elif not self._entry_needs_refresh(synced):
+                    logger.debug("Credentials file has valid token, using without refresh")
+                    return synced
+            if self.provider == "nous":
+                synced = self._sync_nous_entry_from_auth_store(entry)
+                if synced.refresh_token != entry.refresh_token:
+                    logger.debug("Nous refresh failed but auth.json has newer tokens — adopting")
+                    updated = replace(
+                        synced,
+                        last_status=STATUS_OK,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    self._sync_device_code_entry_to_auth_store(updated)
+                    return updated
+            return None
+
+        updated = replace(
+            updated,
+            last_status=STATUS_OK,
+            last_status_at=None,
+            last_error_code=None,
+            last_error_reason=None,
+            last_error_message=None,
+            last_error_reset_at=None,
+        )
+        self._sync_device_code_entry_to_auth_store(updated)
+        return updated
+
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
         if entry.auth_type != AUTH_TYPE_OAUTH:
             return False
@@ -818,8 +964,7 @@ class CredentialPool:
         return False
 
     def select(self) -> Optional[PooledCredential]:
-        with self._lock:
-            return self._select_unlocked()
+        return self._select_unlocked()
 
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
         """Return entries not currently in exhaustion cooldown.
@@ -827,11 +972,21 @@ class CredentialPool:
         When *clear_expired* is True, entries whose cooldown has elapsed are
         reset to STATUS_OK and persisted.  When *refresh* is True, entries
         that need a token refresh are refreshed (skipped on failure).
+
+        Locking: only the snapshot and the final apply/persist phases hold
+        the pool lock. File sync reads and network refreshes run OUTSIDE
+        the lock; all replacements are applied under the lock with a
+        single batched persist.
         """
         now = time.time()
-        cleared_any = False
-        available: List[PooledCredential] = []
-        for entry in self._entries:
+        # Phase 1: snapshot under lock (no I/O while holding it).
+        with self._lock:
+            snapshot = list(self._entries)
+        # Phase 2: file sync + network refresh OUTSIDE the lock.
+        updates: Dict[str, PooledCredential] = {}
+        skip_ids: set = set()
+        resolved: Dict[str, PooledCredential] = {}
+        for entry in snapshot:
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
             # by other processes (Claude Code CLI, other Hermes profiles).
@@ -840,7 +995,7 @@ class CredentialPool:
                 synced = self._sync_anthropic_entry_from_credentials_file(entry)
                 if synced is not entry:
                     entry = synced
-                    cleared_any = True
+                    updates[entry.id] = entry
             # For nous entries, sync from auth.json before status checks.
             # Another process may have successfully refreshed via
             # resolve_nous_runtime_credentials(), making this entry's
@@ -851,7 +1006,7 @@ class CredentialPool:
                 synced = self._sync_nous_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
-                    cleared_any = True
+                    updates[entry.id] = entry
             # For openai-codex entries, same pattern: the user may have
             # re-authed via `hermes model` / `hermes auth` after a 429/401,
             # leaving fresh tokens on disk while the pool entry is still
@@ -863,13 +1018,14 @@ class CredentialPool:
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
-                    cleared_any = True
+                    updates[entry.id] = entry
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
                 if exhausted_until is not None and now < exhausted_until:
+                    resolved[entry.id] = entry
                     continue
                 if clear_expired:
-                    cleared = replace(
+                    entry = replace(
                         entry,
                         last_status=STATUS_OK,
                         last_status_at=None,
@@ -878,51 +1034,78 @@ class CredentialPool:
                         last_error_message=None,
                         last_error_reset_at=None,
                     )
-                    self._replace_entry(entry, cleared)
-                    entry = cleared
-                    cleared_any = True
+                    updates[entry.id] = entry
             if refresh and self._entry_needs_refresh(entry):
-                refreshed = self._refresh_entry(entry, force=False)
+                refreshed = self._refresh_entry_deferred(entry, force=False)
                 if refreshed is None:
+                    updates[entry.id] = self._build_exhausted_replacement(entry, None)
+                    skip_ids.add(entry.id)
                     continue
-                entry = refreshed
-            available.append(entry)
-        if cleared_any:
-            self._persist()
-        return available
+                if refreshed is not entry:
+                    entry = refreshed
+                    updates[entry.id] = entry
+            resolved[entry.id] = entry
+        # Phase 3: apply under lock with a single batched persist.
+        with self._lock:
+            if updates:
+                for eid, new in updates.items():
+                    self._replace_entry_by_id(eid, new)
+                self._persist()
+            available: List[PooledCredential] = []
+            for entry in self._entries:
+                cur = resolved.get(entry.id, entry)
+                if cur.id in skip_ids:
+                    continue
+                if cur.last_status == STATUS_EXHAUSTED:
+                    exhausted_until = _exhausted_until(cur)
+                    if exhausted_until is not None and now < exhausted_until:
+                        continue
+                available.append(cur)
+            return available
+
+    def _replace_entry_by_id(self, entry_id: str, new: PooledCredential) -> None:
+        """Swap an entry by id (same as _replace_entry, explicit id key)."""
+        for idx, entry in enumerate(self._entries):
+            if entry.id == entry_id:
+                self._entries[idx] = new
+                return
 
     def _select_unlocked(self) -> Optional[PooledCredential]:
+        # File sync + network refresh happen OUTSIDE the pool lock inside
+        # _available_entries; only the strategy bookkeeping below holds it.
         available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
-            self._current_id = None
+            with self._lock:
+                self._current_id = None
             logger.info("credential pool: no available entries (all exhausted or empty)")
             return None
 
-        if self._strategy == STRATEGY_RANDOM:
-            entry = random.choice(available)
+        with self._lock:
+            if self._strategy == STRATEGY_RANDOM:
+                entry = random.choice(available)
+                self._current_id = entry.id
+                return entry
+
+            if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
+                entry = min(available, key=lambda e: e.request_count)
+                # Increment usage counter so subsequent selections distribute load
+                updated = replace(entry, request_count=entry.request_count + 1)
+                self._replace_entry(entry, updated)
+                self._current_id = entry.id
+                return updated
+
+            if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
+                entry = available[0]
+                rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
+                rotated.append(replace(entry, priority=len(self._entries) - 1))
+                self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
+                self._persist()
+                self._current_id = entry.id
+                return self.current() or entry
+
+            entry = available[0]
             self._current_id = entry.id
             return entry
-
-        if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
-            entry = min(available, key=lambda e: e.request_count)
-            # Increment usage counter so subsequent selections distribute load
-            updated = replace(entry, request_count=entry.request_count + 1)
-            self._replace_entry(entry, updated)
-            self._current_id = entry.id
-            return updated
-
-        if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
-            entry = available[0]
-            rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
-            rotated.append(replace(entry, priority=len(self._entries) - 1))
-            self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
-            self._persist()
-            self._current_id = entry.id
-            return self.current() or entry
-
-        entry = available[0]
-        self._current_id = entry.id
-        return entry
 
     def peek(self) -> Optional[PooledCredential]:
         current = self.current()
@@ -937,22 +1120,24 @@ class CredentialPool:
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[PooledCredential]:
+        # Selection (incl. file sync + refresh) runs outside the lock;
+        # only the exhausted-marking holds it briefly.
+        entry = self.current() or self._select_unlocked()
+        if entry is None:
+            return None
+        _label = entry.label or entry.id[:8]
+        logger.info(
+            "credential pool: marking %s exhausted (status=%s), rotating",
+            _label, status_code,
+        )
         with self._lock:
-            entry = self.current() or self._select_unlocked()
-            if entry is None:
-                return None
-            _label = entry.label or entry.id[:8]
-            logger.info(
-                "credential pool: marking %s exhausted (status=%s), rotating",
-                _label, status_code,
-            )
             self._mark_exhausted(entry, status_code, error_context)
             self._current_id = None
-            next_entry = self._select_unlocked()
-            if next_entry:
-                _next_label = next_entry.label or next_entry.id[:8]
-                logger.info("credential pool: rotated to %s", _next_label)
-            return next_entry
+        next_entry = self._select_unlocked()
+        if next_entry:
+            _next_label = next_entry.label or next_entry.id[:8]
+            logger.info("credential pool: rotated to %s", _next_label)
+        return next_entry
 
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
@@ -968,10 +1153,12 @@ class CredentialPool:
                 self._current_id = credential_id
                 return credential_id
 
-            available = self._available_entries(clear_expired=True, refresh=True)
-            if not available:
-                return None
+        # File sync + network refresh run OUTSIDE the pool lock.
+        available = self._available_entries(clear_expired=True, refresh=True)
+        if not available:
+            return None
 
+        with self._lock:
             below_cap = [
                 entry for entry in available
                 if self._active_leases.get(entry.id, 0) < self._max_concurrent
@@ -995,8 +1182,23 @@ class CredentialPool:
                 self._active_leases[credential_id] = count - 1
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
+        # Snapshot under lock; network refresh runs OUTSIDE the lock;
+        # apply + single persist back under lock.
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            entry = self.current()
+        if entry is None:
+            return None
+        refreshed = self._refresh_entry_deferred(entry, force=True)
+        with self._lock:
+            if refreshed is not None:
+                self._replace_entry(entry, refreshed)
+                self._persist()
+                self._current_id = refreshed.id
+                return refreshed
+            exhausted = self._build_exhausted_replacement(entry, None)
+            self._replace_entry(entry, exhausted)
+            self._persist()
+            return None
 
     def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
         entry = self.current()

@@ -1421,7 +1421,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if "require_mention" in rule_cfg:
                     per_chat_require_mention = _to_boolean(rule_cfg.get("require_mention"))
                 group_rules[str(chat_id)] = FeishuGroupRule(
-                    policy=str(rule_cfg.get("policy", "open")).strip().lower(),
+                    policy=str(rule_cfg.get("policy", "allowlist")).strip().lower(),
                     allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
                     require_mention=per_chat_require_mention,

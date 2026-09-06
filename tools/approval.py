@@ -32,6 +32,12 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="",
 )
 
+# mtime/TTL cache for the approvals config block (~5s). Avoids a YAML
+# parse per terminal command; load_config() itself is mtime-cached but
+# this skips even the merge/copy on hot paths.
+_APPROVAL_CONFIG_TTL_S = 5.0
+_APPROVAL_CONFIG_CACHE: dict = {"mtime_ns": None, "at": 0.0, "value": {}}
+
 
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     """Invoke a plugin lifecycle hook for the approval system.
@@ -690,11 +696,33 @@ def _normalize_approval_mode(mode) -> str:
 
 
 def _get_approval_config() -> dict:
-    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
+    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc.
+
+    Cached by config-file mtime with a ~5s TTL so per-terminal-command
+    checks don't re-parse YAML every call. Returns a copy; callers must
+    not mutate the cached dict.
+    """
+    global _APPROVAL_CONFIG_CACHE
     try:
         from hermes_cli.config import load_config
+        from hermes_constants import get_hermes_home
+        now = time.monotonic()
+        cached = _APPROVAL_CONFIG_CACHE
+        try:
+            cfg_path = get_hermes_home() / "config.yaml"
+            mtime_ns = cfg_path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = -1
+        if (cached.get("mtime_ns") == mtime_ns
+                and (now - cached.get("at", 0.0)) < _APPROVAL_CONFIG_TTL_S
+                and isinstance(cached.get("value"), dict)):
+            return dict(cached["value"])
         config = load_config()
-        return config.get("approvals", {}) or {}
+        value = config.get("approvals", {}) or {}
+        if not isinstance(value, dict):
+            value = {}
+        _APPROVAL_CONFIG_CACHE = {"mtime_ns": mtime_ns, "at": now, "value": dict(value)}
+        return dict(value)
     except Exception as e:
         logger.warning("Failed to load approval config: %s", e)
         return {}
@@ -717,9 +745,7 @@ def _get_approval_timeout() -> int:
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        mode = str(cfg_get(config, "approvals", "cron_mode", default="deny")).lower().strip()
+        mode = str(_get_approval_config().get("cron_mode", "deny")).lower().strip()
         if mode in ("approve", "off", "allow", "yes"):
             return "approve"
         return "deny"

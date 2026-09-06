@@ -167,26 +167,26 @@ def _make_interaction(
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compat: empty allowlist → everything passes (matches on_message)
+# Fail-closed: empty allowlists → denied (require explicit allowlist/pairing)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_no_allowlist_allows_everyone(adapter):
-    """SECURITY-CRITICAL backwards-compat: deployments without any allowlist
-    env vars set must see ZERO behavior change. on_message lets everyone
-    through in this case (returns True at line 1890); slash must do the same.
-    """
+    """Fail-closed: with no allowlist env vars set, slash invocations are
+    DENIED until an explicit allowlist/pairing is configured
+    (``_is_allowed_user`` returns False when both allowlists are empty)."""
     interaction = _make_interaction("999999999")
-    assert await adapter._check_slash_authorization(interaction, "/help") is True
-    interaction.response.send_message.assert_not_awaited()
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_no_allowlist_dm_also_allowed(adapter):
-    """Same for DMs — no allowlist means no restriction, matching on_message."""
+    """Same for DMs — no allowlist means denied (fail closed)."""
     interaction = _make_interaction("999999999", in_dm=True)
-    assert await adapter._check_slash_authorization(interaction, "/help") is True
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -258,25 +258,33 @@ async def test_channel_not_in_allowlist_rejected(adapter, monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_channel_in_allowlist_passes(adapter, monkeypatch):
+    """Channel on DISCORD_ALLOWED_CHANNELS but no user allowlist: still
+    DENIED — the user/role gate is fail-closed when both allowlists are
+    empty, even when the channel gate passes."""
     monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "1111,2222")
     interaction = _make_interaction("100200300", channel_id=1111)
-    assert await adapter._check_slash_authorization(interaction, "/help") is True
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_channel_allowlist_wildcard_passes(adapter, monkeypatch):
-    """``*`` in DISCORD_ALLOWED_CHANNELS = allow any channel, matching on_message."""
+    """``*`` in DISCORD_ALLOWED_CHANNELS with no user allowlist: still
+    DENIED — the channel wildcard does not satisfy the user/role gate."""
     monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "*")
     interaction = _make_interaction("100200300", channel_id=9999)
-    assert await adapter._check_slash_authorization(interaction, "/help") is True
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_channel_allowlist_does_not_apply_to_dms(adapter, monkeypatch):
-    """DMs aren't channel-gated — they go through on_message's DM lockdown."""
+    """DMs skip channel gating, but the user/role gate still applies:
+    with no user allowlist the DM invocation is DENIED (fail closed)."""
     monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "1111")
     interaction = _make_interaction("100200300", in_dm=True)
-    assert await adapter._check_slash_authorization(interaction, "/help") is True
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -429,10 +437,11 @@ async def test_missing_channel_id_rejected_when_channel_policy_configured(
 
 @pytest.mark.asyncio
 async def test_missing_channel_id_allowed_when_no_channel_policy(adapter):
-    """No DISCORD_ALLOWED_CHANNELS configured + missing channel id: still
-    pass through the channel block (matches no-allowlist default)."""
+    """No DISCORD_ALLOWED_CHANNELS configured + missing channel id + no user
+    allowlist: still DENIED — the user/role gate is fail-closed."""
     interaction = _make_interaction("100200300", channel_id=None)
-    assert await adapter._check_slash_authorization(interaction, "/help") is True
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -462,13 +471,15 @@ async def test_missing_user_allowed_when_no_allowlist_configured(adapter):
 
 @pytest.mark.asyncio
 async def test_thread_parent_in_allowlist_passes(adapter, monkeypatch):
-    """Thread whose parent channel is on DISCORD_ALLOWED_CHANNELS passes
-    even though the thread id itself isn't on the list."""
+    """Thread whose parent channel is on DISCORD_ALLOWED_CHANNELS, but no
+    user allowlist: still DENIED — channel pass does not satisfy the
+    fail-closed user/role gate."""
     monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "5555")
     interaction = _make_interaction(
         "100200300", channel_id=9999, in_thread=True, parent_channel_id=5555,
     )
-    assert await adapter._check_slash_authorization(interaction, "/help") is True
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -735,3 +746,29 @@ async def test_skill_handler_dispatches_for_authorized(
     interaction = _make_interaction("100200300")
     await handler(interaction, "alpha", "extra args")
     assert dispatched == ["/alpha extra args"]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed _is_allowed_user + pre-registration skill state
+# ---------------------------------------------------------------------------
+
+
+def test_is_allowed_user_denies_when_both_allowlists_empty(adapter):
+    """Both allowlists empty → False (fail closed — require explicit
+    allowlist/pairing). Calls the real gate with the evil input."""
+    adapter._allowed_user_ids = set()
+    adapter._allowed_role_ids = set()
+    assert adapter._is_allowed_user("999999999") is False
+
+
+def test_is_allowed_user_allows_listed_user(adapter):
+    """Sanity: an explicitly listed user still passes."""
+    adapter._allowed_user_ids = {"999999999"}
+    assert adapter._is_allowed_user("999999999") is True
+
+
+def test_skill_state_initialized_pre_registration(adapter):
+    """DiscordAdapter inits _skill_entries/_skill_lookup empty
+    pre-registration (no catalog leak before _register_skill_group runs)."""
+    assert adapter._skill_entries == []
+    assert adapter._skill_lookup == {}

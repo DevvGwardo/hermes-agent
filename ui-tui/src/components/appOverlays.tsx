@@ -117,9 +117,26 @@ export function FloatingOverlays({
 
   const start = Math.max(0, Math.min(compIdx - Math.floor(COMPLETION_WINDOW / 2), completions.length - viewportSize))
 
+  // Small-terminal overflow guard: stacked FloatBoxes overdraw and push
+  // content off-screen.  Render only the topmost overlay by priority and
+  // let the rest wait their turn.
+  // Priority (highest first): pager > skillsHub > modelPicker > picker >
+  // agentList > completions.
+  const topmost = overlay.pager
+    ? 'pager'
+    : overlay.skillsHub
+      ? 'skillsHub'
+      : overlay.modelPicker
+        ? 'modelPicker'
+        : overlay.picker
+          ? 'picker'
+          : overlay.agentList
+            ? 'agentList'
+            : null
+
   return (
     <Box alignItems="flex-start" bottom="100%" flexDirection="column" left={0} position="absolute" right={0}>
-      {overlay.agentList && (
+      {topmost === 'agentList' && (
         <FloatBox color={ui.theme.color.border}>
           <AgentListView
             gw={gw}
@@ -129,7 +146,7 @@ export function FloatingOverlays({
         </FloatBox>
       )}
 
-      {overlay.picker && (
+      {topmost === 'picker' && (
         <FloatBox color={ui.theme.color.border}>
           <SessionPicker
             gw={gw}
@@ -140,7 +157,7 @@ export function FloatingOverlays({
         </FloatBox>
       )}
 
-      {overlay.modelPicker && (
+      {topmost === 'modelPicker' && (
         <FloatBox color={ui.theme.color.border}>
           <ModelPicker
             gw={gw}
@@ -152,39 +169,39 @@ export function FloatingOverlays({
         </FloatBox>
       )}
 
-      {overlay.skillsHub && (
+      {topmost === 'skillsHub' && (
         <FloatBox color={ui.theme.color.border}>
           <SkillsHub gw={gw} onClose={() => patchOverlayState({ skillsHub: false })} t={ui.theme} />
         </FloatBox>
       )}
 
-      {overlay.pager && (
+      {topmost === 'pager' && (
         <FloatBox color={ui.theme.color.border}>
           <Box flexDirection="column" paddingX={1} paddingY={1}>
-            {overlay.pager.title && (
+            {overlay.pager!.title && (
               <Box justifyContent="center" marginBottom={1}>
                 <Text bold color={ui.theme.color.primary}>
-                  {overlay.pager.title}
+                  {overlay.pager!.title}
                 </Text>
               </Box>
             )}
 
-            {overlay.pager.lines.slice(overlay.pager.offset, overlay.pager.offset + pagerPageSize).map((line, i) => (
+            {overlay.pager!.lines.slice(overlay.pager!.offset, overlay.pager!.offset + pagerPageSize).map((line, i) => (
               <Text key={i}>{line}</Text>
             ))}
 
             <Box marginTop={1}>
               <OverlayHint t={ui.theme}>
-                {overlay.pager.offset + pagerPageSize < overlay.pager.lines.length
-                  ? `↑↓/jk line · Enter/Space/PgDn page · b/PgUp back · g/G top/bottom · Esc/q close (${Math.min(overlay.pager.offset + pagerPageSize, overlay.pager.lines.length)}/${overlay.pager.lines.length})`
-                  : `end · ↑↓/jk · b/PgUp back · g top · Esc/q close (${overlay.pager.lines.length} lines)`}
+                {overlay.pager!.offset + pagerPageSize < overlay.pager!.lines.length
+                  ? `↑↓/jk line · Enter/Space/PgDn page · b/PgUp back · g/G top/bottom · Esc/q close (${Math.min(overlay.pager!.offset + pagerPageSize, overlay.pager!.lines.length)}/${overlay.pager!.lines.length})`
+                  : `end · ↑↓/jk · b/PgUp back · g top · Esc/q close (${overlay.pager!.lines.length} lines)`}
               </OverlayHint>
             </Box>
           </Box>
         </FloatBox>
       )}
 
-      {!!completions.length && (
+      {topmost === null && !!completions.length && (
         <FloatBox color={ui.theme.color.primary}>
           <Box flexDirection="column" width={Math.max(28, cols - 6)}>
             {completions.slice(start, start + viewportSize).map((item, i) => {

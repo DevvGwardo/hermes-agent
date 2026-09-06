@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +23,32 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+# mtime/TTL cache for the SKILL.md rescan: within the TTL *and* with
+# unchanged scan-root mtimes, get_skill_commands() returns the cached map
+# instead of re-walking every SKILL.md on disk.
+_SKILL_COMMANDS_TTL_S = 30.0
+_skill_commands_scanned_at: float = 0.0
+_skill_commands_dir_key: Any = None
+
+
+def _skill_scan_dir_key() -> Any:
+    """Cheap fingerprint of skill scan roots (path + dir mtime)."""
+    try:
+        from tools.skills_tool import SKILLS_DIR
+        from agent.skill_utils import get_external_skills_dirs
+        roots = []
+        if SKILLS_DIR.exists():
+            roots.append(SKILLS_DIR)
+        roots.extend(get_external_skills_dirs())
+        key = []
+        for d in roots:
+            try:
+                key.append((str(d), d.stat().st_mtime_ns))
+            except OSError:
+                key.append((str(d), -1))
+        return tuple(key)
+    except Exception:
+        return None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -301,6 +328,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
+    global _skill_commands_scanned_at, _skill_commands_dir_key
+    _skill_commands_scanned_at = time.monotonic()
+    _skill_commands_dir_key = _skill_scan_dir_key()
     return _skill_commands
 
 
@@ -310,12 +340,19 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     Rescans when the active platform scope changes (e.g. a gateway
     process serving Telegram and Discord concurrently) so each platform
     sees its own ``skills.platform_disabled`` view (#14536).
+
+    Within the TTL with unchanged scan-root mtimes the cached map is
+    returned without re-walking SKILL.md files.
     """
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        scan_skill_commands()
+    if _skill_commands:
+        if _skill_commands_platform == _resolve_skill_commands_platform():
+            try:
+                fresh = (time.monotonic() - _skill_commands_scanned_at) < _SKILL_COMMANDS_TTL_S
+            except Exception:
+                fresh = False
+            if fresh and _skill_scan_dir_key() == _skill_commands_dir_key:
+                return _skill_commands
+    scan_skill_commands()
     return _skill_commands
 
 

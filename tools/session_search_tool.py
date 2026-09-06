@@ -26,6 +26,15 @@ from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
+# Bounds for the match-scan in _truncate_around_matches.
+_MAX_MATCH_POSITIONS_PER_TERM = 500
+_MAX_WINDOW_CANDIDATES = 500
+
+# Bounds applied BEFORE transcript formatting so giant sessions can't blow
+# up memory/time in _format_conversation.
+_MAX_SEARCH_MESSAGES = 1000
+_MAX_SEARCH_MESSAGE_CHARS = 20_000
+
 
 def _get_session_search_max_concurrency(default: int = 3) -> int:
     """Read auxiliary.session_search.max_concurrency with sane bounds."""
@@ -118,11 +127,16 @@ def _truncate_around_matches(
     Strategy (in priority order):
     1. Try to find the full query as a phrase (case-insensitive).
     2. If no phrase hit, look for positions where all query terms appear
-       within a 200-char proximity window (co-occurrence).
+        within a 200-char proximity window (co-occurrence).
     3. Fall back to individual term positions.
 
     Once candidate positions are collected the function picks the window
     start that covers the most of them.
+
+    Bounded-window scan: per-term occurrences are capped (first
+    _MAX_MATCH_POSITIONS_PER_TERM) and the window-pick loop runs over at
+    most _MAX_WINDOW_CANDIDATES positions so pathological transcripts
+    can't turn the O(P^2) coverage pick into a hang.
     """
     if len(full_text) <= max_chars:
         return full_text
@@ -131,9 +145,18 @@ def _truncate_around_matches(
     query_lower = query.lower().strip()
     match_positions: list[int] = []
 
+    def _bounded_finditer(pat: "re.Pattern[str]", text: str, cap: int) -> list[int]:
+        """Collect up to *cap* match starts (bounded-window scan)."""
+        out: list[int] = []
+        for m in pat.finditer(text):
+            out.append(m.start())
+            if len(out) >= cap:
+                break
+        return out
+
     # --- 1. Full-phrase search ------------------------------------------------
     phrase_pat = re.compile(re.escape(query_lower))
-    match_positions = [m.start() for m in phrase_pat.finditer(text_lower)]
+    match_positions = _bounded_finditer(phrase_pat, text_lower, _MAX_MATCH_POSITIONS_PER_TERM)
 
     # --- 2. Proximity co-occurrence of all terms (within 200 chars) -----------
     if not match_positions:
@@ -142,9 +165,9 @@ def _truncate_around_matches(
             # Collect every occurrence of each term
             term_positions: dict[str, list[int]] = {}
             for t in terms:
-                term_positions[t] = [
-                    m.start() for m in re.finditer(re.escape(t), text_lower)
-                ]
+                term_positions[t] = _bounded_finditer(
+                    re.compile(re.escape(t)), text_lower, _MAX_MATCH_POSITIONS_PER_TERM
+                )
             # Slide through positions of the rarest term and check proximity
             rarest = min(terms, key=lambda t: len(term_positions.get(t, [])))
             for pos in term_positions.get(rarest, []):
@@ -159,8 +182,13 @@ def _truncate_around_matches(
     if not match_positions:
         terms = query_lower.split()
         for t in terms:
-            for m in re.finditer(re.escape(t), text_lower):
-                match_positions.append(m.start())
+            match_positions.extend(
+                _bounded_finditer(
+                    re.compile(re.escape(t)), text_lower, _MAX_MATCH_POSITIONS_PER_TERM
+                )
+            )
+            if len(match_positions) >= _MAX_MATCH_POSITIONS_PER_TERM:
+                break
 
     if not match_positions:
         # Nothing at all — take from the start
@@ -169,7 +197,12 @@ def _truncate_around_matches(
         return truncated + suffix
 
     # --- Pick window that covers the most match positions ---------------------
+    # Bounded: evenly sample candidates so the O(C^2) coverage pick below
+    # stays cheap even when a term occurs thousands of times.
     match_positions.sort()
+    if len(match_positions) > _MAX_WINDOW_CANDIDATES:
+        step = len(match_positions) / _MAX_WINDOW_CANDIDATES
+        match_positions = [match_positions[int(i * step)] for i in range(_MAX_WINDOW_CANDIDATES)]
 
     best_start = 0
     best_count = 0
@@ -379,30 +412,170 @@ def session_search(
 
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
+        # Batched: parent links for the whole result set are fetched with as
+        # few round-trips as possible (single WHERE id IN per frontier level)
+        # instead of one get_session per chain link per result.
+        def _batch_parent_map(session_ids: list) -> Optional[Dict[str, Any]]:
+            """Return {id: parent_session_id} via one WHERE id IN query.
+
+            Returns None when the fast path is unavailable so the caller
+            can fall back to per-id lookups.
+            """
+            ids = [s for s in dict.fromkeys(session_ids) if s]
+            if not ids:
+                return {}
+            try:
+                conn = getattr(db, "_conn", None)
+                if conn is None:
+                    return None
+                placeholders = ",".join("?" for _ in ids)
+                lock = getattr(db, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        rows = conn.execute(
+                            "SELECT id, parent_session_id FROM sessions "
+                            f"WHERE id IN ({placeholders})",
+                            ids,
+                        ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, parent_session_id FROM sessions "
+                        f"WHERE id IN ({placeholders})",
+                        ids,
+                    ).fetchall()
+                return {r["id"]: r["parent_session_id"] for r in rows}
+            except Exception:
+                logging.debug("Batched lineage lookup failed, falling back", exc_info=True)
+                return None
+
+        def _resolve_many_to_parents(seed_ids: list) -> Dict[str, str]:
+            """Resolve each seed id to its lineage root (batched)."""
+            seeds = [s for s in dict.fromkeys(seed_ids) if s]
+            parent_of: Dict[str, Any] = {}
+            frontier = list(seeds)
+            depth = 0
+            batched_ok = True
+            while frontier and depth < 25:
+                batch = _batch_parent_map(frontier)
+                if batch is None:
+                    batched_ok = False
+                    break
+                nxt: list = []
+
+                def _adopt(sid: str, parent: Any) -> None:
+                    parent_of[sid] = parent
+                    if parent and parent not in parent_of and parent not in nxt:
+                        nxt.append(parent)
+
+                missing: list = []
+                for sid in frontier:
+                    if sid in parent_of:
+                        continue
+                    if sid in batch:
+                        _adopt(sid, batch[sid])
+                    else:
+                        # Row absent from the batch result (unknown session or
+                        # non-SQL store): single memoized lookup per id.
+                        missing.append(sid)
+                for sid in missing:
+                    try:
+                        session = db.get_session(sid)
+                    except Exception:
+                        logging.debug(
+                            "Error resolving parent for session %s",
+                            sid,
+                            exc_info=True,
+                        )
+                        session = None
+                    _adopt(sid, session.get("parent_session_id") if session else None)
+                frontier = nxt
+                depth += 1
+            if batched_ok:
+                roots: Dict[str, str] = {}
+                for sid in seeds:
+                    seen: set = set()
+                    cur = sid
+                    while cur and cur not in seen:
+                        seen.add(cur)
+                        parent = parent_of.get(cur)
+                        if not parent:
+                            break
+                        cur = parent
+                    roots[sid] = cur
+                return roots
+            # Fallback: memoized per-id walk (shares one cache across seeds).
+            shared_cache: Dict[str, str] = {}
+
+            def _walk(sid: str) -> str:
+                if sid in shared_cache:
+                    return shared_cache[sid]
+                visited: set = set()
+                cur = sid
+                trail: list = []
+                while cur and cur not in visited:
+                    if cur in shared_cache:
+                        cur = shared_cache[cur]
+                        break
+                    visited.add(cur)
+                    trail.append(cur)
+                    try:
+                        session = db.get_session(cur)
+                        if not session:
+                            break
+                        parent = session.get("parent_session_id")
+                        if parent:
+                            cur = parent
+                        else:
+                            break
+                    except Exception:
+                        logging.debug(
+                            "Error resolving parent for session %s",
+                            cur,
+                            exc_info=True,
+                        )
+                        break
+                for t in trail:
+                    shared_cache[t] = cur
+                return cur
+
+            return {sid: _walk(sid) for sid in seeds}
+
+        def _cap_messages_for_search(
+            messages: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            """Cap/truncate messages BEFORE formatting (bounded transcript).
+
+            Sessions under the caps pass through untouched (identical
+            output). Oversized sessions are trimmed: giant single messages
+            are head/tail-truncated, and very long histories keep the first
+            50 + last (_MAX_SEARCH_MESSAGES - 50) turns.
+            """
+            if len(messages) > _MAX_SEARCH_MESSAGES:
+                keep_tail = _MAX_SEARCH_MESSAGES - 50
+                messages = messages[:50] + messages[-keep_tail:]
+            capped: List[Dict[str, Any]] = []
+            for msg in messages:
+                if isinstance(msg, dict):
+                    content = msg.get("content")
+                    if isinstance(content, str) and len(content) > _MAX_SEARCH_MESSAGE_CHARS:
+                        half = _MAX_SEARCH_MESSAGE_CHARS // 2
+                        msg = dict(
+                            msg,
+                            content=content[:half]
+                            + "\n...[message truncated for search]...\n"
+                            + content[-half:],
+                        )
+                capped.append(msg)
+            return capped
+
+        lineage_seeds = [r["session_id"] for r in raw_results]
+        if current_session_id and current_session_id not in lineage_seeds:
+            lineage_seeds.append(current_session_id)
+        _resolved_roots = _resolve_many_to_parents(lineage_seeds)
+
         def _resolve_to_parent(session_id: str) -> str:
             """Walk delegation chain to find the root parent session ID."""
-            visited = set()
-            sid = session_id
-            while sid and sid not in visited:
-                visited.add(sid)
-                try:
-                    session = db.get_session(sid)
-                    if not session:
-                        break
-                    parent = session.get("parent_session_id")
-                    if parent:
-                        sid = parent
-                    else:
-                        break
-                except Exception as e:
-                    logging.debug(
-                        "Error resolving parent for session %s: %s",
-                        sid,
-                        e,
-                        exc_info=True,
-                    )
-                    break
-            return sid
+            return _resolved_roots.get(session_id, session_id)
 
         current_lineage_root = (
             _resolve_to_parent(current_session_id) if current_session_id else None
@@ -436,6 +609,9 @@ def session_search(
                 if not messages:
                     continue
                 session_meta = db.get_session(session_id) or {}
+                # Cap/truncate BEFORE formatting so giant sessions don't
+                # build a multi-MB transcript just to truncate it after.
+                messages = _cap_messages_for_search(messages)
                 conversation_text = _format_conversation(messages)
                 conversation_text = _truncate_around_matches(conversation_text, query)
                 tasks.append((session_id, match_info, conversation_text, session_meta))

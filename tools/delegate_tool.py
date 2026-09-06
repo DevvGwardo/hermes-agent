@@ -244,6 +244,11 @@ def list_active_subagents() -> List[Dict[str, Any]]:
         ]
 
 
+# Bounded scan window for _extract_output_tail: only the tail of the
+# child's conversation is ever inspected (overlay shows last N results).
+_TAIL_SCAN_WINDOW = 400
+
+
 def _extract_output_tail(
     result: Dict[str, Any],
     *,
@@ -256,28 +261,25 @@ def _extract_output_tail(
     We reuse the same messages list the trajectory saver walks, taking
     only the tail to keep event payloads small.  Each entry is
     ``{tool, preview, is_error}``.
+
+    Bounded reverse walk: only the last _TAIL_SCAN_WINDOW messages are
+    inspected (single reverse pass to collect tool results, then a single
+    forward pass over that same window to resolve tool names) instead of
+    mapping the full conversation forward.
     """
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
         return []
 
-    # Walk in reverse to build a tail; stop when we have enough.
+    # Bounded window from the tail — the overlay only shows the last
+    # max_entries tool results, so scanning the whole history is waste.
+    window = messages[-_TAIL_SCAN_WINDOW:] if len(messages) > _TAIL_SCAN_WINDOW else messages
+
+    # Reverse pass: pick tool results, newest first; remember which
+    # tool_call_ids need name resolution.
     tail: List[Dict[str, Any]] = []
-    pending_call_by_id: Dict[str, str] = {}
-
-    # First pass (forward): build tool_call_id -> tool_name map
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                tc_id = tc.get("id")
-                fn = tc.get("function") or {}
-                if tc_id:
-                    pending_call_by_id[tc_id] = str(fn.get("name") or "tool")
-
-    # Second pass (reverse): pick tool results, newest first
-    for msg in reversed(messages):
+    needed_ids: set = set()
+    for msg in reversed(window):
         if len(tail) >= max_entries:
             break
         if not isinstance(msg, dict) or msg.get("role") != "tool":
@@ -286,12 +288,33 @@ def _extract_output_tail(
         if not isinstance(content, str):
             content = str(content)
         is_error = _looks_like_error_output(content)
-        tool_name = pending_call_by_id.get(msg.get("tool_call_id") or "", "tool")
+        tc_id = msg.get("tool_call_id") or ""
+        needed_ids.add(tc_id)
         # Preserve line structure so the overlay's wrapped scroll region can
         # show real output rather than a whitespace-collapsed blob. We still
         # cap the payload size to keep events bounded.
         preview = content[:max_chars]
-        tail.append({"tool": tool_name, "preview": preview, "is_error": is_error})
+        tail.append({"tool": "tool", "preview": preview, "is_error": is_error,
+                     "_tc_id": tc_id})
+
+    # Forward pass over the SAME bounded window: resolve tool names.
+    if needed_ids:
+        name_by_id: Dict[str, str] = {}
+        for msg in window:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                tc_id = tc.get("id")
+                if tc_id in needed_ids and tc_id not in name_by_id:
+                    fn = tc.get("function") or {}
+                    name_by_id[tc_id] = str(fn.get("name") or "tool")
+            if len(name_by_id) >= len(needed_ids):
+                break
+        for entry in tail:
+            entry["tool"] = name_by_id.get(entry.pop("_tc_id") or "", "tool")
+    else:
+        for entry in tail:
+            entry.pop("_tc_id", None)
 
     tail.reverse()  # restore chronological order for display
     return tail

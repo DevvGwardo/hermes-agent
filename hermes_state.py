@@ -98,6 +98,13 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+-- Prune-path covering index: prune_sessions() filters on started_at range +
+-- ended_at IS NOT NULL (+ optional source). Range head on started_at.
+-- Migration-safe: IF NOT EXISTS, no backfill, evaluated at startup.
+-- (The title-NULL ghost-prune partial index lives in _init_schema next to
+-- idx_sessions_title_unique — it must be created post-reconcile because
+-- pre-reconcile tables on old DBs lack the title column.)
+CREATE INDEX IF NOT EXISTS idx_sessions_prune ON sessions(started_at, ended_at, source);
 """
 
 FTS_SQL = """
@@ -380,6 +387,36 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    _FTS_BACKFILL_CHUNK = 5000
+
+    def _backfill_fts_chunked(self, cursor: sqlite3.Cursor, table: str) -> None:
+        """Populate an FTS5 index from messages in id-ordered chunks.
+
+        Commits every chunk (default 5k rows) instead of inserting the whole
+        table in one statement, so the first ``SessionDB()`` on a large
+        pre-existing DB doesn't hold the WAL write lock for the entire
+        backfill and lets other processes interleave. Crash-safe:
+        schema_version stays < 11 until the backfill completes, so an
+        interrupted run re-drops the tables and restarts cleanly.
+        *table* is an internal constant (messages_fts/messages_fts_trigram).
+        """
+        row = cursor.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()
+        max_id = row[0] if row else 0
+        lo = 0
+        while lo < max_id:
+            hi = lo + self._FTS_BACKFILL_CHUNK
+            cursor.execute(
+                f"INSERT INTO {table}(rowid, content) "
+                "SELECT id, "
+                "COALESCE(content, '') || ' ' || "
+                "COALESCE(tool_name, '') || ' ' || "
+                "COALESCE(tool_calls, '') "
+                "FROM messages WHERE id > ? AND id <= ?",
+                (lo, hi),
+            )
+            self._conn.commit()
+            lo = hi
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -464,23 +501,11 @@ class SessionDB:
                 # schema that indexes content || tool_name || tool_calls.
                 cursor.executescript(FTS_SQL)
                 cursor.executescript(FTS_TRIGRAM_SQL)
-                # Backfill both indexes from every existing messages row.
-                cursor.execute(
-                    "INSERT INTO messages_fts(rowid, content) "
-                    "SELECT id, "
-                    "COALESCE(content, '') || ' ' || "
-                    "COALESCE(tool_name, '') || ' ' || "
-                    "COALESCE(tool_calls, '') "
-                    "FROM messages"
-                )
-                cursor.execute(
-                    "INSERT INTO messages_fts_trigram(rowid, content) "
-                    "SELECT id, "
-                    "COALESCE(content, '') || ' ' || "
-                    "COALESCE(tool_name, '') || ' ' || "
-                    "COALESCE(tool_calls, '') "
-                    "FROM messages"
-                )
+                # Backfill both indexes from every existing messages row,
+                # chunked (5k rows/commit) so startup doesn't hold the WAL
+                # write lock for one giant transaction.
+                self._backfill_fts_chunked(cursor, "messages_fts")
+                self._backfill_fts_chunked(cursor, "messages_fts_trigram")
             if current_version < SCHEMA_VERSION:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -492,6 +517,18 @@ class SessionDB:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
                 "ON sessions(title) WHERE title IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+
+        # Ghost-prune partial index — created here (post-reconcile) rather
+        # than in SCHEMA_SQL because pre-reconcile tables on old DBs lack
+        # the title column. Startup-safe: IF NOT EXISTS, no backfill.
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_ghost_prune "
+                "ON sessions(source, started_at) "
+                "WHERE title IS NULL AND ended_at IS NOT NULL"
             )
         except sqlite3.OperationalError:
             pass  # Index already exists
@@ -827,7 +864,13 @@ class SessionDB:
                 (title, session_id),
             )
             return cursor.rowcount
-        rowcount = self._execute_write(_do)
+        try:
+            rowcount = self._execute_write(_do)
+        except sqlite3.IntegrityError:
+            # Partial UNIQUE index idx_sessions_title_unique hit under
+            # gateway+CLI concurrency (TOCTOU between the pre-check SELECT
+            # above and the UPDATE). Preserve the documented API contract.
+            raise ValueError(f"Title '{title}' is already in use")
         return rowcount > 0
 
     def get_session_title(self, session_id: str) -> Optional[str]:
@@ -1011,6 +1054,135 @@ class SessionDB:
             params.extend(exclude_sources)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        if project_compression_tips and not include_children:
+            # Batched tip projection: one recursive CTE maps every surfaced
+            # root to its compression tip (same single-child walk as
+            # get_compression_tip: latest child per hop, depth < 100), then a
+            # single SELECT returns tip fields alongside root rows. LIMIT /
+            # OFFSET apply to the already-projected rows, so pages can't
+            # shrink the way pre-projection LIMIT + per-row Python merges can.
+            tip_cte = f"""
+                WITH RECURSIVE chain(root_id, cur_id, depth) AS (
+                    SELECT s.id, s.id, 0 FROM sessions s {where_sql}
+                    UNION ALL
+                    SELECT c.root_id, (
+                        SELECT child.id
+                        FROM sessions child
+                        JOIN sessions parent ON parent.id = c.cur_id
+                        WHERE child.parent_session_id = c.cur_id
+                          AND parent.end_reason = 'compression'
+                          AND parent.ended_at IS NOT NULL
+                          AND child.started_at >= parent.ended_at
+                        ORDER BY child.started_at DESC, child.id DESC
+                        LIMIT 1
+                    ), c.depth + 1
+                    FROM chain c
+                    WHERE c.depth < 100
+                      AND EXISTS (
+                        SELECT 1
+                        FROM sessions child2
+                        JOIN sessions parent2 ON parent2.id = c.cur_id
+                        WHERE child2.parent_session_id = c.cur_id
+                          AND parent2.end_reason = 'compression'
+                          AND parent2.ended_at IS NOT NULL
+                          AND child2.started_at >= parent2.ended_at
+                      )
+                ),
+                tips AS (
+                    SELECT root_id, cur_id AS tip_id, MAX(depth) AS _d
+                    FROM chain GROUP BY root_id
+                )
+            """
+            cm_cte = ""
+            cm_join = ""
+            if order_by_last_active:
+                cm_cte = """,
+                chain_max AS (
+                    SELECT
+                        root_id,
+                        MAX(COALESCE(
+                            (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = cur_id),
+                            (SELECT started_at FROM sessions ss WHERE ss.id = cur_id)
+                        )) AS effective_last_active
+                    FROM chain
+                    GROUP BY root_id
+                )
+                """
+                cm_join = "LEFT JOIN chain_max cm ON cm.root_id = s.id"
+                eff_select = "COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active"
+                proj_order = "ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC"
+            else:
+                eff_select = "s.started_at AS _effective_last_active"
+                proj_order = "ORDER BY s.started_at DESC"
+            proj_query = f"""
+                {tip_cte}{cm_cte}
+                SELECT s.*,
+                    tp.id AS _tip_id,
+                    tp.ended_at AS _tip_ended_at,
+                    tp.end_reason AS _tip_end_reason,
+                    tp.message_count AS _tip_message_count,
+                    tp.tool_call_count AS _tip_tool_call_count,
+                    tp.title AS _tip_title,
+                    tp.model AS _tip_model,
+                    tp.system_prompt AS _tip_system_prompt,
+                    COALESCE(
+                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                         FROM messages m
+                         WHERE m.session_id = tp.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = tp.id),
+                        tp.started_at
+                    ) AS last_active,
+                    {eff_select}
+                FROM sessions s
+                JOIN tips ON tips.root_id = s.id
+                JOIN sessions tp ON tp.id = tips.tip_id
+                {cm_join}
+                {where_sql}
+                {proj_order}
+                LIMIT ? OFFSET ?
+            """
+            # WHERE params apply twice (CTE seed + outer select).
+            proj_params = params + params + [limit, offset]
+            with self._lock:
+                cursor = self._conn.execute(proj_query, proj_params)
+                proj_rows = cursor.fetchall()
+            projected_sessions = []
+            for row in proj_rows:
+                s = dict(row)
+                raw = (s.pop("_preview_raw", "") or "").strip()
+                if raw:
+                    text = raw[:60]
+                    s["preview"] = text + ("..." if len(raw) > 60 else "")
+                else:
+                    s["preview"] = ""
+                s.pop("_effective_last_active", None)
+                tip_id = s.pop("_tip_id", None)
+                tip_ended_at = s.pop("_tip_ended_at", None)
+                tip_end_reason = s.pop("_tip_end_reason", None)
+                tip_message_count = s.pop("_tip_message_count", None)
+                tip_tool_call_count = s.pop("_tip_tool_call_count", None)
+                tip_title = s.pop("_tip_title", None)
+                tip_model = s.pop("_tip_model", None)
+                tip_system_prompt = s.pop("_tip_system_prompt", None)
+                if tip_id is not None and tip_id != s["id"]:
+                    # Same merge keys as the legacy per-row path below:
+                    # root keeps started_at/parent/source, tip provides
+                    # identity + activity data.
+                    s["_lineage_root_id"] = s["id"]
+                    s["id"] = tip_id
+                    s["ended_at"] = tip_ended_at
+                    s["end_reason"] = tip_end_reason
+                    s["message_count"] = tip_message_count
+                    s["tool_call_count"] = tip_tool_call_count
+                    s["title"] = tip_title
+                    s["model"] = tip_model
+                    s["system_prompt"] = tip_system_prompt
+                projected_sessions.append(s)
+            return projected_sessions
         if order_by_last_active:
             # Compute effective_last_active by walking each surfaced session's
             # compression-continuation chain forward in SQL and taking the MAX
@@ -1844,67 +2016,85 @@ class SessionDB:
                 else:
                     matches = [dict(row) for row in cursor.fetchall()]
 
-        # Add surrounding context (1 message before + after each match).
-        # Done outside the lock so we don't hold it across N sequential queries.
-        for match in matches:
+        # Batched surrounding context (1 message before + after each match)
+        # via a single window-function query: LAG/LEAD OVER
+        # (PARTITION BY session_id ORDER BY timestamp, id) resolve every
+        # match's neighbors in one round-trip under one short lock hold,
+        # instead of one CTE per match (N+1 queries under repeated lock
+        # cycling that serializes gateway readers).
+        if matches:
+            match_ids = [m["id"] for m in matches]
+            match_sids = list({m["session_id"] for m in matches})
+            _sid_ph = ",".join("?" for _ in match_sids)
+            _mid_ph = ",".join("?" for _ in match_ids)
+            _ctx_sql = f"""
+                WITH w AS (
+                    SELECT m.session_id AS session_id,
+                           m.id AS id,
+                           m.role AS role,
+                           m.content AS content,
+                           LAG(m.id) OVER (
+                               PARTITION BY m.session_id
+                               ORDER BY m.timestamp, m.id
+                           ) AS prev_id,
+                           LEAD(m.id) OVER (
+                               PARTITION BY m.session_id
+                               ORDER BY m.timestamp, m.id
+                           ) AS next_id
+                    FROM messages m
+                    WHERE m.session_id IN ({_sid_ph})
+                ),
+                mw AS (
+                    SELECT id, prev_id, next_id FROM w
+                    WHERE id IN ({_mid_ph})
+                )
+                SELECT w.session_id AS session_id,
+                       w.id AS id,
+                       w.role AS role,
+                       w.content AS content,
+                       mw.id AS match_id,
+                       CASE WHEN w.id = mw.id THEN 0
+                            WHEN w.id = mw.prev_id THEN -1
+                            ELSE 1
+                       END AS pos
+                FROM w
+                JOIN mw ON w.id = mw.id
+                        OR w.id = mw.prev_id
+                        OR w.id = mw.next_id
+                ORDER BY match_id, pos
+            """
             try:
                 with self._lock:
-                    ctx_cursor = self._conn.execute(
-                        """WITH target AS (
-                               SELECT session_id, timestamp, id
-                               FROM messages
-                               WHERE id = ?
-                           )
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
-                               ORDER BY m.timestamp DESC, m.id DESC
-                               LIMIT 1
-                           )
-                           UNION ALL
-                           SELECT role, content
-                           FROM messages
-                           WHERE id = ?
-                           UNION ALL
-                           SELECT role, content
-                           FROM (
-                               SELECT m.id, m.timestamp, m.role, m.content
-                               FROM messages m
-                               JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
-                               ORDER BY m.timestamp ASC, m.id ASC
-                               LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
-                    )
-                    context_msgs = []
-                    for r in ctx_cursor.fetchall():
-                        raw = r["content"]
-                        decoded = self._decode_content(raw)
-                        # Multimodal context: render a compact text-only
-                        # summary for search previews.
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                p.get("text", "") for p in decoded
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
-                        context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
-                        )
-                match["context"] = context_msgs
+                    _ctx_rows = self._conn.execute(
+                        _ctx_sql, match_sids + match_ids
+                    ).fetchall()
             except Exception:
-                match["context"] = []
+                _ctx_rows = []
+            _by_match: Dict[Any, list] = {}
+            for _r in _ctx_rows:
+                _by_match.setdefault(_r["match_id"], []).append(_r)
+            for match in matches:
+                _group = _by_match.get(match["id"], [])
+                context_msgs = []
+                for _r in sorted(_group, key=lambda r: r["pos"]):
+                    decoded = self._decode_content(_r["content"])
+                    # Multimodal context: render a compact text-only
+                    # summary for search previews.
+                    if isinstance(decoded, list):
+                        text_parts = [
+                            p.get("text", "") for p in decoded
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        text = " ".join(t for t in text_parts if t).strip()
+                        preview = text or "[multimodal content]"
+                    elif isinstance(decoded, str):
+                        preview = decoded
+                    else:
+                        preview = ""
+                    context_msgs.append(
+                        {"role": _r["role"], "content": preview[:200]}
+                    )
+                match["context"] = context_msgs
 
         # Remove full content from result (snippet is enough, saves tokens)
         for match in matches:
@@ -2107,18 +2297,34 @@ class SessionDB:
                 return 0
 
             # Orphan any sessions whose parent is about to be deleted
-            placeholders = ",".join("?" * len(session_ids))
-            conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({placeholders})",
-                list(session_ids),
-            )
-
-            for sid in session_ids:
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-                removed_ids.append(sid)
-            return len(session_ids)
+            # (chunked IN-lists: SQLite caps bound variables), then batched
+            # set-based deletes instead of one DELETE per session.
+            ids = list(session_ids)
+            _CHUNK = 500
+            for i in range(0, len(ids), _CHUNK):
+                chunk = ids[i:i + _CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(
+                    f"UPDATE sessions SET parent_session_id = NULL "
+                    f"WHERE parent_session_id IN ({placeholders})",
+                    chunk,
+                )
+            for i in range(0, len(ids), _CHUNK):
+                chunk = ids[i:i + _CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(
+                    f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+                    chunk,
+                )
+            for i in range(0, len(ids), _CHUNK):
+                chunk = ids[i:i + _CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(
+                    f"DELETE FROM sessions WHERE id IN ({placeholders})",
+                    chunk,
+                )
+                removed_ids.extend(chunk)
+            return len(ids)
 
         count = self._execute_write(_do)
         # Clean up on-disk files outside the DB transaction

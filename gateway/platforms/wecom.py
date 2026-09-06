@@ -18,9 +18,9 @@ Configuration in config.yaml:
           bot_id: "your-bot-id"          # or WECOM_BOT_ID env var
           secret: "your-secret"          # or WECOM_SECRET env var
           websocket_url: "wss://openws.work.weixin.qq.com"
-          dm_policy: "open"              # open | allowlist | disabled | pairing
+          dm_policy: "allowlist"       # open | allowlist | disabled | pairing (default: allowlist)
           allow_from: ["user_id_1"]
-          group_policy: "open"           # open | allowlist | disabled
+          group_policy: "allowlist"        # open | allowlist | disabled (default: allowlist)
           group_allow_from: ["group_id_1"]
           groups:
             group_id_1:
@@ -158,10 +158,10 @@ class WeComAdapter(BasePlatformAdapter):
             or os.getenv("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
         ).strip() or DEFAULT_WS_URL
 
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "open")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "allowlist")).strip().lower()
         self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
 
-        self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
+        self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "allowlist")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
 

@@ -8200,6 +8200,31 @@ class AIAgent:
         return base_url_host_matches(self._base_url_lower, "portal.qwen.ai")
 
     def _qwen_prepare_chat_messages(self, api_messages: list) -> list:
+        # Fast path (mirrors the vision fast-path above): skip the deepcopy
+        # when no message needs normalization and the system message already
+        # carries cache_control — nothing would be mutated.
+        _needs_qwen_prep = False
+        for msg in api_messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                _needs_qwen_prep = True
+                break
+            if isinstance(content, list) and any(isinstance(p, str) for p in content):
+                _needs_qwen_prep = True
+                break
+        if not _needs_qwen_prep:
+            for msg in api_messages:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    content = msg.get("content")
+                    if (isinstance(content, list) and content
+                            and isinstance(content[-1], dict)
+                            and content[-1].get("cache_control") != {"type": "ephemeral"}):
+                        _needs_qwen_prep = True
+                    break
+        if not _needs_qwen_prep:
+            return api_messages
         prepared = copy.deepcopy(api_messages)
         if not prepared:
             return prepared
@@ -8259,6 +8284,56 @@ class AIAgent:
                 if isinstance(content, list) and content and isinstance(content[-1], dict):
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
+
+    def _approx_request_size_cached(self, api_messages: list) -> tuple:
+        """Incremental char/token totals for pre-flight logging.
+
+        The history only grows between turns, so when the cached prefix is
+        still identical (same length or same leading objects) we only
+        stringify the NEW messages instead of re-walking the full history
+        every turn. Totals feed logging/telemetry only (approximate by
+        design); any structural change falls back to a full recompute.
+        """
+        cache = getattr(self, "_request_size_cache", None)
+        n = len(api_messages)
+        if cache is not None:
+            cached_n = cache.get("count", 0)
+            first_id = id(api_messages[0]) if n else None
+            last_cached_id = cache.get("last_id")
+            if n == cached_n and cached_n > 0 and first_id == cache.get("first_id") \
+                    and id(api_messages[-1]) == last_cached_id:
+                return cache["chars"], cache["tokens"]
+            if n > cached_n and cached_n > 0 and first_id == cache.get("first_id"):
+                try:
+                    if all(a is b for a, b in zip(api_messages, cache.get("prefix_ids_objs", ()))):
+                        delta = sum(len(str(m)) for m in api_messages[cached_n:])
+                        total_chars = cache["chars"] + delta
+                        approx_tokens = (total_chars + 3) // 4
+                        self._request_size_cache = {
+                            "count": n,
+                            "chars": total_chars,
+                            "tokens": approx_tokens,
+                            "first_id": first_id,
+                            "last_id": id(api_messages[-1]),
+                            "prefix_ids_objs": tuple(api_messages),
+                        }
+                        return total_chars, approx_tokens
+                except Exception:
+                    pass
+        total_chars = sum(len(str(msg)) for msg in api_messages)
+        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        try:
+            self._request_size_cache = {
+                "count": n,
+                "chars": total_chars,
+                "tokens": approx_tokens,
+                "first_id": id(api_messages[0]) if n else None,
+                "last_id": id(api_messages[-1]) if n else None,
+                "prefix_ids_objs": tuple(api_messages),
+            }
+        except Exception:
+            pass
+        return total_chars, approx_tokens
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
@@ -10162,7 +10237,9 @@ class AIAgent:
                     messages.append(skip_msg)
                 break
 
-            if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
+            # Pacing delay is an error/backoff path only: skip the sleep on
+            # healthy sequential calls so the common case pays no penalty.
+            if self.tool_delay > 0 and _is_error_result and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
 
         # ── Per-turn aggregate budget enforcement ─────────────────────────
@@ -11018,9 +11095,9 @@ class AIAgent:
             # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
             _sanitize_messages_surrogates(api_messages)
 
-            # Calculate approximate request size for logging
-            total_chars = sum(len(str(msg)) for msg in api_messages)
-            approx_tokens = estimate_messages_tokens_rough(api_messages)
+            # Calculate approximate request size for logging (incremental:
+            # only new messages are stringified when history just grew).
+            total_chars, approx_tokens = self._approx_request_size_cached(api_messages)
             
             # Thinking spinner for quiet mode (animated during API call)
             thinking_spinner = None

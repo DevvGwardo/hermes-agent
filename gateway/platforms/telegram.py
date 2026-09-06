@@ -334,7 +334,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
-            return True
+            return False
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 

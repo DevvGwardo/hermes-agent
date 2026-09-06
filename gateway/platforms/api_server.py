@@ -390,7 +390,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id",
 }
 
 
@@ -592,6 +592,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Queued next-turn prompts per run (POST /v1/runs/{id}/queue and
+        # steer-fallback).  Drained FIFO by the run worker after the
+        # current turn finishes, mirroring ACP queued_prompts.
+        self._run_queues: Dict[str, List[str]] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
@@ -840,6 +844,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_steer": True,
+                "run_queue": True,
                 "tool_progress_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "cors": bool(self._cors_origins),
@@ -854,6 +860,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
+                "run_queue": {"method": "POST", "path": "/v1/runs/{run_id}/queue"},
             },
         })
 
@@ -938,7 +946,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # Sanitize: reject control characters that could enable header injection.
             if re.search(r'[\r\n\x00]', provided_session_id):
                 return web.json_response(
-                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                    _openai_error(
+                        "Invalid session ID",
+                        code="invalid_session_id",
+                        param="messages[i].content",
+                    ),
                     status=400,
                 )
             session_id = provided_session_id
@@ -2457,8 +2469,30 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
+        # Normalize run input through the same multimodal validators as
+        # /v1/chat/completions and /v1/responses: image parts pass through
+        # as OpenAI content blocks, while file parts are rejected with 400
+        # unsupported_content_type instead of str() coercion.
+        input_messages: List[Dict[str, Any]] = []
+        if isinstance(raw_input, str):
+            input_messages = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            for idx, item in enumerate(raw_input):
+                if isinstance(item, str):
+                    input_messages.append({"role": "user", "content": item})
+                elif isinstance(item, dict):
+                    role = item.get("role", "user")
+                    try:
+                        content = _normalize_multimodal_content(item.get("content", ""))
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+                    input_messages.append({"role": role, "content": content})
+        else:
+            return web.json_response(_openai_error("'input' must be a string or array"), status=400)
+
+        user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
+        conversation_tail: List[Dict[str, Any]] = input_messages[:-1]
+        if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
@@ -2466,7 +2500,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -2480,7 +2514,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                try:
+                    entry_content = _normalize_multimodal_content(entry["content"])
+                except ValueError as exc:
+                    return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
+                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -2493,20 +2531,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 if instructions is None:
                     instructions = stored.get("instructions")
 
-        # When input is a multi-message array, extract all but the last
-        # message as conversation history (the last becomes user_message).
+        # When input is a multi-message array, all but the last message
+        # become conversation history (the last becomes user_message).
         # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
-            for msg in raw_input[:-1]:
-                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+        if not conversation_history:
+            conversation_history.extend(conversation_tail)
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
@@ -2551,11 +2580,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                 )
                 self._active_run_agents[run_id] = agent
-                def _run_sync():
+                def _run_sync(msg, hist):
                     effective_task_id = session_id or run_id
                     r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
+                        user_message=msg,
+                        conversation_history=hist,
                         task_id=effective_task_id,
                     )
                     u = {
@@ -2565,8 +2594,60 @@ class APIServerAdapter(BasePlatformAdapter):
                     }
                     return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                def _add_usage(total, part):
+                    for key in ("input_tokens", "output_tokens", "total_tokens"):
+                        total[key] = total.get(key, 0) + part.get(key, 0)
+                    return total
+
+                result, usage = await asyncio.get_running_loop().run_in_executor(
+                    None, _run_sync, user_message, conversation_history,
+                )
+                total_usage = _add_usage(
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, usage,
+                )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                # Drain POST /v1/runs/{id}/queue items FIFO as chained
+                # follow-up turns (mirrors ACP queued_prompts): each queued
+                # prompt runs as a new user turn with prior turns folded
+                # into history.  Totals accumulate across turns.
+                current_message: Any = user_message
+                current_history = conversation_history
+                while True:
+                    pending = self._run_queues.get(run_id)
+                    if not pending:
+                        break
+                    next_prompt = pending.pop(0)
+                    current_history = current_history + [
+                        {"role": "user", "content": current_message},
+                        {"role": "assistant", "content": final_response},
+                    ]
+                    current_message = next_prompt
+                    self._set_run_status(run_id, "running", last_event="run.queued_turn_started")
+                    try:
+                        q.put_nowait({
+                            "event": "run.queued_turn_started",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "depth_remaining": len(pending),
+                        })
+                    except Exception:
+                        pass
+                    result, usage = await asyncio.get_running_loop().run_in_executor(
+                        None, _run_sync, current_message, current_history,
+                    )
+                    total_usage = _add_usage(total_usage, usage)
+                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    try:
+                        q.put_nowait({
+                            "event": "run.queued_turn_completed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "output": final_response,
+                            "depth_remaining": len(pending),
+                        })
+                    except Exception:
+                        pass
+                usage = total_usage
                 q.put_nowait({
                     "event": "run.completed",
                     "run_id": run_id,
@@ -2614,13 +2695,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
-                # Sentinel: signal SSE stream to close
+                # Sentinel: signal SSE stream to close.  Pending /queue
+                # items are dropped on stop/failure with the run.
                 try:
                     q.put_nowait(None)
                 except Exception:
                     pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
+                self._run_queues.pop(run_id, None)
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
@@ -2737,6 +2820,135 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — inject guidance into the live turn.
+
+        Wire shape mirrors TUI ``session.steer``: ``{status, text}`` with
+        status ``queued`` (accepted) or ``rejected``.
+
+        Busy-vs-queue semantics, consistent across surfaces:
+
+        * steer lands MID-turn — the text is appended to the next tool
+          result inside the same agent run (``agent.steer()``, cf.
+          gateway/run.py /steer and ACP ``_cmd_steer``).  No interrupt,
+          no new user turn, no role-alternation violation.
+        * queue (see ``_handle_queue_run``) lands at the NEXT turn
+          boundary — the prompt runs as a full follow-up turn after the
+          current one finishes (cf. ACP ``queued_prompts``).
+
+        Contrast with the adjacent surfaces: TUI ``prompt.submit``
+        rejects busy sessions outright (4009 "session busy"), while ACP
+        ``prompt`` queues busy input as the next turn.  The runs API
+        offers both behaviours explicitly — steer for mid-turn, queue
+        for next-turn — so clients never have to guess.
+
+        When no live agent holds the run yet (still queued/starting) or
+        the agent lacks ``steer()``, the text falls back to queue
+        semantics instead of being dropped.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        text = body.get("text", "")
+        if not isinstance(text, str):
+            return web.json_response(
+                _openai_error("'text' must be a string", code="invalid_steer_text", param="text"),
+                status=400,
+            )
+        text = text.strip()
+        if not text:
+            return web.json_response(
+                _openai_error("Missing 'text' field", code="missing_steer_text", param="text"),
+                status=400,
+            )
+
+        agent = self._active_run_agents.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+        if agent is None and task is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        if agent is not None and hasattr(agent, "steer"):
+            try:
+                accepted = bool(agent.steer(text))
+            except Exception as exc:
+                logger.warning("[api_server] steer failed for run %s: %s", run_id, exc)
+                accepted = False
+            if accepted:
+                return web.json_response({"run_id": run_id, "status": "queued", "text": text})
+            return web.json_response({"run_id": run_id, "status": "rejected", "text": text})
+
+        # No live agent yet, or agent without steer() — fall back to
+        # queue semantics (mirrors the gateway pending-sentinel fallback).
+        self._run_queues.setdefault(run_id, []).append(text)
+        depth = len(self._run_queues[run_id])
+        return web.json_response({
+            "run_id": run_id,
+            "status": "queued",
+            "text": text,
+            "depth": depth,
+            "note": "no live agent for steer; queued for the next turn",
+        })
+
+    async def _handle_queue_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/queue — queue a prompt as the next turn.
+
+        The prompt runs as a full follow-up turn after the current turn
+        (and any earlier queued items) finishes — FIFO, no merging, no
+        interrupt.  Drained by the run worker; progress surfaces as
+        ``run.queued_turn_started`` / ``run.queued_turn_completed`` SSE
+        events.  See ``_handle_steer_run`` for the mid-turn alternative
+        and the busy-vs-queue comparison across surfaces.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        prompt = body.get("prompt", "")
+        if not isinstance(prompt, str):
+            return web.json_response(
+                _openai_error("'prompt' must be a string", code="invalid_queue_prompt", param="prompt"),
+                status=400,
+            )
+        prompt = prompt.strip()
+        if not prompt:
+            return web.json_response(
+                _openai_error("Missing 'prompt' field", code="missing_queue_prompt", param="prompt"),
+                status=400,
+            )
+
+        agent = self._active_run_agents.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+        if agent is None and task is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        self._run_queues.setdefault(run_id, []).append(prompt)
+        depth = len(self._run_queues[run_id])
+        return web.json_response({
+            "run_id": run_id,
+            "status": "queued",
+            "prompt": prompt,
+            "depth": depth,
+        })
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -2753,6 +2965,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams_created.pop(run_id, None)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
+                self._run_queues.pop(run_id, None)
 
             stale_statuses = [
                 run_id
@@ -2800,6 +3013,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/runs/{run_id}/steer", self._handle_steer_run)
+            self._app.router.add_post("/v1/runs/{run_id}/queue", self._handle_queue_run)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

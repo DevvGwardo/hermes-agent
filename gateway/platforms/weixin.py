@@ -1160,7 +1160,7 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("send_chunk_retry_delay_seconds")
             or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "allowlist")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
         if allow_from is None:

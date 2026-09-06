@@ -127,38 +127,38 @@ def _load_config() -> Dict[str, Any]:
     return cur
 
 
-def is_enabled() -> bool:
+def is_enabled(cfg: Optional[Dict[str, Any]] = None) -> bool:
     """Default ON when no config says otherwise."""
-    cfg = _load_config()
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
     return bool(cfg.get("enabled", True))
 
 
-def get_interval_hours() -> int:
-    cfg = _load_config()
+def get_interval_hours(cfg: Optional[Dict[str, Any]] = None) -> int:
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
     try:
         return int(cfg.get("interval_hours", DEFAULT_INTERVAL_HOURS))
     except (TypeError, ValueError):
         return DEFAULT_INTERVAL_HOURS
 
 
-def get_min_idle_hours() -> float:
-    cfg = _load_config()
+def get_min_idle_hours(cfg: Optional[Dict[str, Any]] = None) -> float:
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
     try:
         return float(cfg.get("min_idle_hours", DEFAULT_MIN_IDLE_HOURS))
     except (TypeError, ValueError):
         return DEFAULT_MIN_IDLE_HOURS
 
 
-def get_stale_after_days() -> int:
-    cfg = _load_config()
+def get_stale_after_days(cfg: Optional[Dict[str, Any]] = None) -> int:
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
     try:
         return int(cfg.get("stale_after_days", DEFAULT_STALE_AFTER_DAYS))
     except (TypeError, ValueError):
         return DEFAULT_STALE_AFTER_DAYS
 
 
-def get_archive_after_days() -> int:
-    cfg = _load_config()
+def get_archive_after_days(cfg: Optional[Dict[str, Any]] = None) -> int:
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
     try:
         return int(cfg.get("archive_after_days", DEFAULT_ARCHIVE_AFTER_DAYS))
     except (TypeError, ValueError):
@@ -199,7 +199,8 @@ def should_run_now(now: Optional[datetime] = None) -> bool:
     whether an agent is actively running — here we only enforce the static
     gates.
     """
-    if not is_enabled():
+    cfg = _load_config()
+    if not is_enabled(cfg):
         return False
     if is_paused():
         return False
@@ -227,7 +228,7 @@ def should_run_now(now: Optional[datetime] = None) -> bool:
         now = datetime.now(timezone.utc)
     if last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
-    interval = timedelta(hours=get_interval_hours())
+    interval = timedelta(hours=get_interval_hours(cfg))
     return (now - last) >= interval
 
 
@@ -243,8 +244,9 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
 
     if now is None:
         now = datetime.now(timezone.utc)
-    stale_cutoff = now - timedelta(days=get_stale_after_days())
-    archive_cutoff = now - timedelta(days=get_archive_after_days())
+    cfg = _load_config()
+    stale_cutoff = now - timedelta(days=get_stale_after_days(cfg))
+    archive_cutoff = now - timedelta(days=get_archive_after_days(cfg))
 
     counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0}
 
@@ -1590,7 +1592,7 @@ def maybe_run_curator(
             return None
         # Idle gating: only enforce when the caller provided a measurement.
         if idle_for_seconds is not None:
-            min_idle_s = get_min_idle_hours() * 3600.0
+            min_idle_s = get_min_idle_hours(_load_config()) * 3600.0
             if idle_for_seconds < min_idle_s:
                 return None
         return run_curator_review(on_summary=on_summary)

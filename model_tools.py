@@ -22,6 +22,7 @@ Public API (signatures preserved from the original 2,400-line version):
 
 import json
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
@@ -40,6 +41,24 @@ logger = logging.getLogger(__name__)
 _tool_loop = None          # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
+
+# Shared executor for sync->async bridging when a loop is already running
+# (gateway / RL env). Reused across calls instead of a fresh
+# ThreadPoolExecutor(max_workers=1) per tool call.
+_ASYNC_BRIDGE_EXECUTOR: Optional["concurrent.futures.ThreadPoolExecutor"] = None
+_ASYNC_BRIDGE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_async_bridge_executor() -> "concurrent.futures.ThreadPoolExecutor":
+    """Return the shared bridge executor (created once, never shut down)."""
+    global _ASYNC_BRIDGE_EXECUTOR
+    with _ASYNC_BRIDGE_EXECUTOR_LOCK:
+        if _ASYNC_BRIDGE_EXECUTOR is None:
+            _ASYNC_BRIDGE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=8,
+                thread_name_prefix="hermes-async-bridge",
+            )
+        return _ASYNC_BRIDGE_EXECUTOR
 
 
 def _get_tool_loop():
@@ -107,13 +126,14 @@ def _run_async(coro):
         loop = None
 
     if loop and loop.is_running():
-        # Inside an async context (gateway, RL env) — run in a fresh thread
+        # Inside an async context (gateway, RL env) — run in a worker thread
         # with its own event loop we own a reference to, so on timeout we
         # can cancel the task inside that loop (ThreadPoolExecutor.cancel()
         # only works on not-yet-started futures — it's a no-op on a running
         # worker, which previously leaked the thread on every 300 s timeout).
-        import concurrent.futures
-
+        # The worker thread comes from a SHARED executor (not a fresh
+        # ThreadPoolExecutor(max_workers=1) per call) to avoid thread
+        # churn on hot tool paths.
         worker_loop: Optional[asyncio.AbstractEventLoop] = None
         loop_ready = threading.Event()
 
@@ -139,7 +159,7 @@ def _run_async(coro):
                     pass
                 worker_loop.close()
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _get_async_bridge_executor()
         future = pool.submit(_run_in_worker)
         try:
             return future.result(timeout=300)
@@ -154,11 +174,8 @@ def _run_async(coro):
                     # Loop already closed — nothing to cancel.
                     pass
             raise
-        finally:
-            # wait=False: don't block the caller on a stuck coroutine. We've
-            # already requested cancellation above; the worker will exit
-            # once the coroutine observes it (usually at the next await).
-            pool.shutdown(wait=False)
+        # NOTE: shared executor — never shut down here. The previous
+        # per-call pool.shutdown(wait=False) is gone with the per-call pool.
 
     # If we're on a worker thread (e.g., parallel tool execution in
     # delegate_task), use a per-thread persistent loop.  This avoids

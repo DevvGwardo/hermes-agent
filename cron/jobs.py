@@ -44,6 +44,11 @@ _jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# mtime/size cache for jobs.json so hot paths (get_due_jobs, tick) don't
+# re-parse JSON every call. Keyed on (mtime_ns, size); save_jobs() refreshes
+# it on write so readers never see stale data.
+_JOBS_CACHE: Dict[str, Any] = {"mtime_ns": None, "size": None, "jobs": []}
+
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
     """Normalize legacy/single-skill and multi-skill inputs into a unique ordered list."""
@@ -339,15 +344,27 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # =============================================================================
 
 def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+    """Load all jobs from storage (mtime-cached; returns a copy)."""
+    global _JOBS_CACHE
     ensure_dirs()
     if not JOBS_FILE.exists():
         return []
-    
+
+    try:
+        st = JOBS_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if _JOBS_CACHE.get("mtime_ns") == key[0] and _JOBS_CACHE.get("size") == key[1]:
+            return copy.deepcopy(_JOBS_CACHE.get("jobs", []))
+    except OSError:
+        key = None
+
     try:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return data.get("jobs", [])
+            jobs = data.get("jobs", [])
+            if key is not None:
+                _JOBS_CACHE = {"mtime_ns": key[0], "size": key[1], "jobs": copy.deepcopy(jobs)}
+            return jobs
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         try:
@@ -369,6 +386,7 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
+    global _JOBS_CACHE
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
@@ -378,6 +396,15 @@ def save_jobs(jobs: List[Dict[str, Any]]):
             os.fsync(f.fileno())
         atomic_replace(tmp_path, JOBS_FILE)
         _secure_file(JOBS_FILE)
+        try:
+            st = JOBS_FILE.stat()
+            _JOBS_CACHE = {
+                "mtime_ns": st.st_mtime_ns,
+                "size": st.st_size,
+                "jobs": copy.deepcopy(jobs),
+            }
+        except OSError:
+            _JOBS_CACHE = {"mtime_ns": None, "size": None, "jobs": []}
     except BaseException:
         try:
             os.unlink(tmp_path)

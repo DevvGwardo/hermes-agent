@@ -70,7 +70,7 @@ const renderIndicator = (style: IndicatorStyle, tick: number): IndicatorRender =
   return { frame, intervalMs: Math.max(SPINNER_TICK_MS, spinner.interval), showVerb: false }
 }
 
-function FaceTicker({ color, startedAt }: { color: string; startedAt?: null | number }) {
+function FaceTicker({ active = true, color, startedAt }: { active?: boolean; color: string; startedAt?: null | number }) {
   const ui = useStore($uiState)
   const style = ui.indicatorStyle
   const [tick, setTick] = useState(() => Math.floor(Math.random() * 1000))
@@ -84,6 +84,13 @@ function FaceTicker({ color, startedAt }: { color: string; startedAt?: null | nu
   const { intervalMs, showVerb } = renderIndicator(style, 0)
 
   useEffect(() => {
+    // Paused when inactive (turn idle / overlay hidden unmounts us, but
+    // this also guards programmatic renders) so the 100ms ascii, 1s
+    // clock, and 2.5s verb timers never tick in the background.
+    if (!active) {
+      return
+    }
+
     const glyph = setInterval(() => setTick(n => n + 1), intervalMs)
     const clock = setInterval(() => setNow(Date.now()), 1000)
     // Verb timer is gated on `showVerb` — `unicode` style hides the verb
@@ -98,7 +105,7 @@ function FaceTicker({ color, startedAt }: { color: string; startedAt?: null | nu
         clearInterval(verb)
       }
     }
-  }, [intervalMs, showVerb])
+  }, [active, intervalMs, showVerb])
 
   const { frame } = renderIndicator(style, tick)
   const verb = VERBS[verbTick % VERBS.length] ?? ''
@@ -318,7 +325,7 @@ export function StatusRule({
         <Text color={t.color.border} wrap="truncate-end">
           {'─ '}
           {busy ? (
-            <FaceTicker color={statusColor} startedAt={turnStartedAt} />
+            <FaceTicker active={busy} color={statusColor} startedAt={turnStartedAt} />
           ) : (
             <Text color={statusColor}>{status}</Text>
           )}

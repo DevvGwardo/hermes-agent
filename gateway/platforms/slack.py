@@ -322,6 +322,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Track active assistant thread status indicators so stop_typing can
         # clear them (chat_id → thread_ts).
         self._active_status_threads: Dict[str, str] = {}
+        # Per bot-token lock identities for multi-workspace (cf.
+        # telegram-bot-token / discord-bot-token). Released together with
+        # the app-token platform lock by _release_slack_locks().
+        self._bot_token_lock_identities: List[str] = []
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
         # (channel_id, user_id) to avoid cross-user collisions.
@@ -528,6 +532,32 @@ class SlackAdapter(BasePlatformAdapter):
                 return False
             lock_acquired = True
 
+            # Per bot-token lock for multi-workspace: every workspace token
+            # is a distinct bot identity (cf. telegram-bot-token,
+            # discord-bot-token). Prevents two local gateways from sharing
+            # any one workspace token. Token identities are sha256-hashed
+            # on disk by acquire_scoped_lock — no secret material leaks.
+            from gateway.status import acquire_scoped_lock, release_scoped_lock
+            for _tok in bot_tokens:
+                _acquired, _existing = acquire_scoped_lock(
+                    'slack-bot-token', _tok,
+                    metadata={'platform': self.platform.value},
+                )
+                if not _acquired:
+                    _owner = _existing.get('pid') if isinstance(_existing, dict) else None
+                    _msg = (
+                        'Slack bot token already in use'
+                        + (f' (PID {_owner})' if _owner else '')
+                        + '. Stop the other gateway first.'
+                    )
+                    logger.error('[%s] %s', self.name, _msg)
+                    self._set_fatal_error('slack-bot-token_lock', _msg, retryable=False)
+                    for _held in self._bot_token_lock_identities:
+                        release_scoped_lock('slack-bot-token', _held)
+                    self._bot_token_lock_identities = []
+                    return False
+                self._bot_token_lock_identities.append(_tok)
+
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
             self._app = AsyncApp(token=primary_token)
@@ -662,7 +692,18 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         finally:
             if lock_acquired and not self._running:
-                self._release_platform_lock()
+                self._release_slack_locks()
+
+    def _release_slack_locks(self) -> None:
+        """Release per-bot-token locks plus the app-token platform lock."""
+        from gateway.status import release_scoped_lock
+        for _held in getattr(self, '_bot_token_lock_identities', []):
+            try:
+                release_scoped_lock('slack-bot-token', _held)
+            except Exception:
+                logger.debug('[%s] Failed to release bot-token lock', self.name, exc_info=True)
+        self._bot_token_lock_identities = []
+        self._release_platform_lock()
 
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
@@ -673,7 +714,7 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.warning("[Slack] Error while closing Socket Mode handler: %s", e, exc_info=True)
         self._running = False
 
-        self._release_platform_lock()
+        self._release_slack_locks()
 
         logger.info("[Slack] Disconnected")
 

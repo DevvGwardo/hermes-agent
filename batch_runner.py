@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 import fire
 
 from run_agent import AIAgent
+from hermes_constants import get_hermes_home
 from toolset_distributions import (
     list_distributions, 
     sample_toolsets_from_distribution,
@@ -55,6 +56,65 @@ ALL_POSSIBLE_TOOLS = set(TOOL_TO_TOOLSET_MAP.keys())
 
 # Default stats for tools that weren't used
 DEFAULT_TOOL_STATS = {'count': 0, 'success': 0, 'failure': 0}
+
+
+# Memoized docker image probe results: image -> "present" | "pulled" | "unavailable".
+# _process_single_prompt runs per prompt; without this every prompt sharing an
+# image paid a `docker image inspect` (+ maybe a 600s pull timeout window).
+_DOCKER_IMAGE_PROBE_CACHE: Dict[str, str] = {}
+
+
+def _ensure_docker_image(container_image: str, config: dict, prompt_index: int, batch_num: int) -> Optional[dict]:
+    """Ensure a docker image is available, memoized per image.
+
+    Returns an error-result dict when the image is unavailable, else None.
+    """
+    cached = _DOCKER_IMAGE_PROBE_CACHE.get(container_image)
+    if cached == "unavailable":
+        return {
+            "success": False,
+            "prompt_index": prompt_index,
+            "error": f"Docker image not available: {container_image} (cached probe)",
+            "trajectory": None,
+            "tool_stats": {},
+            "toolsets_used": [],
+            "metadata": {"batch_num": batch_num, "timestamp": datetime.now().isoformat()},
+        }
+    if cached in ("present", "pulled"):
+        return None
+    import subprocess as _sp
+    try:
+        probe = _sp.run(
+            ["docker", "image", "inspect", container_image],
+            capture_output=True, timeout=10,
+        )
+        if probe.returncode != 0:
+            if config.get("verbose"):
+                print(f"   Prompt {prompt_index}: Pulling docker image {container_image}...", flush=True)
+            pull = _sp.run(
+                ["docker", "pull", container_image],
+                capture_output=True, text=True, timeout=600,
+            )
+            if pull.returncode != 0:
+                _DOCKER_IMAGE_PROBE_CACHE[container_image] = "unavailable"
+                return {
+                    "success": False,
+                    "prompt_index": prompt_index,
+                    "error": f"Docker image not available: {container_image}\n{pull.stderr[:500]}",
+                    "trajectory": None,
+                    "tool_stats": {},
+                    "toolsets_used": [],
+                    "metadata": {"batch_num": batch_num, "timestamp": datetime.now().isoformat()},
+                }
+            _DOCKER_IMAGE_PROBE_CACHE[container_image] = "pulled"
+        else:
+            _DOCKER_IMAGE_PROBE_CACHE[container_image] = "present"
+    except FileNotFoundError:
+        pass  # Docker CLI not installed — skip check (e.g., Modal backend)
+    except Exception as img_err:
+        if config.get("verbose"):
+            print(f"   Prompt {prompt_index}: Docker image check failed: {img_err}", flush=True)
+    return None
 
 
 def _normalize_tool_stats(tool_stats: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, int]]:
@@ -260,34 +320,9 @@ def _process_single_prompt(
         # For Modal: skip local check (Modal pulls server-side).
         env_type = os.getenv("TERMINAL_ENV", "local")
         if env_type == "docker":
-            import subprocess as _sp
-            try:
-                probe = _sp.run(
-                    ["docker", "image", "inspect", container_image],
-                    capture_output=True, timeout=10,
-                )
-                if probe.returncode != 0:
-                    if config.get("verbose"):
-                        print(f"   Prompt {prompt_index}: Pulling docker image {container_image}...", flush=True)
-                    pull = _sp.run(
-                        ["docker", "pull", container_image],
-                        capture_output=True, text=True, timeout=600,
-                    )
-                    if pull.returncode != 0:
-                        return {
-                            "success": False,
-                            "prompt_index": prompt_index,
-                            "error": f"Docker image not available: {container_image}\n{pull.stderr[:500]}",
-                            "trajectory": None,
-                            "tool_stats": {},
-                            "toolsets_used": [],
-                            "metadata": {"batch_num": batch_num, "timestamp": datetime.now().isoformat()},
-                        }
-            except FileNotFoundError:
-                pass  # Docker CLI not installed — skip check (e.g., Modal backend)
-            except Exception as img_err:
-                if config.get("verbose"):
-                    print(f"   Prompt {prompt_index}: Docker image check failed: {img_err}", flush=True)
+            _img_err = _ensure_docker_image(container_image, config, prompt_index, batch_num)
+            if _img_err is not None:
+                return _img_err
 
         from tools.terminal_tool import register_task_env_overrides
         overrides = {
@@ -426,6 +461,9 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
     batch_reasoning_stats = {"total_assistant_turns": 0, "turns_with_reasoning": 0, "turns_without_reasoning": 0}
     completed_in_batch = []
     discarded_no_reasoning = 0
+    # Buffered trajectory lines — single write at end of batch instead of
+    # opening/appending the file per prompt.
+    _pending_trajectory_lines: List[str] = []
     
     # Process each prompt sequentially in this batch
     for prompt_index, prompt_data in prompts_to_process:
@@ -470,9 +508,8 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
                 "tool_error_counts": tool_error_counts  # Simple: {tool: failure_count} - normalized
             }
             
-            # Append to batch output file
-            with open(batch_output_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(trajectory_entry, ensure_ascii=False) + "\n")
+            # Buffer the trajectory line; flushed once at end of batch.
+            _pending_trajectory_lines.append(json.dumps(trajectory_entry, ensure_ascii=False))
         
         # Aggregate tool statistics
         for tool_name, stats in result.get("tool_stats", {}).items():
@@ -500,7 +537,12 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
             print(f"   ❌ Prompt {prompt_index} failed (will retry on resume)")
     
     print(f"✅ Batch {batch_num}: Completed ({len(prompts_to_process)} prompts processed)")
-    
+
+    # Single buffered flush of all trajectory lines for this batch.
+    if _pending_trajectory_lines:
+        with open(batch_output_file, 'a', encoding='utf-8') as f:
+            f.write("\n".join(_pending_trajectory_lines) + "\n")
+
     return {
         "batch_num": batch_num,
         "processed": len(prompts_to_process),
@@ -593,8 +635,9 @@ class BatchRunner:
         if not validate_distribution(distribution):
             raise ValueError(f"Unknown distribution: {distribution}. Available: {list(list_distributions().keys())}")
         
-        # Setup output directory
-        self.output_dir = Path("data") / run_name
+        # Setup output directory (profile-aware: anchored under HERMES_HOME,
+        # never a cwd-relative "data" dir).
+        self.output_dir = get_hermes_home() / "data" / run_name
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Checkpoint file

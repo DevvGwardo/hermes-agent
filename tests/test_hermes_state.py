@@ -1678,6 +1678,20 @@ class TestTitleUniqueness:
     def test_get_session_title_nonexistent(self, db):
         assert db.get_session_title("nonexistent") is None
 
+    def test_concurrent_race_maps_integrity_error_to_value_error(self, db):
+        """TOCTOU race between the pre-check SELECT and the UPDATE surfaces
+        sqlite3.IntegrityError from the partial UNIQUE index — the documented
+        contract is ValueError('already in use'), never a raw IntegrityError."""
+        import sqlite3
+        from unittest.mock import patch
+
+        db.create_session("s1", "cli")
+        with patch.object(
+            db, "_execute_write", side_effect=sqlite3.IntegrityError("UNIQUE constraint failed")
+        ):
+            with pytest.raises(ValueError, match="already in use"):
+                db.set_session_title("s1", "my project")
+
 
 class TestTitleLineage:
     """Tests for title lineage resolution and auto-numbering."""

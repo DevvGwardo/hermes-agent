@@ -228,8 +228,72 @@ class TestSlackConnectCleanup:
             result = await adapter.connect()
 
         assert result is False
-        mock_release.assert_called_once_with("slack-app-token", "xapp-fake")
+        # Both the per bot-token lock AND the app-token platform lock are
+        # released on failure (multi-workspace bot tokens must not leak).
+        assert mock_release.call_count == 2
+        mock_release.assert_any_call("slack-bot-token", "xoxb-fake")
+        mock_release.assert_any_call("slack-app-token", "xapp-fake")
         assert adapter._platform_lock_identity is None
+        assert adapter._bot_token_lock_identities == []
+
+
+class TestSlackBotTokenLocks:
+    """Pin per bot-token locks for multi-workspace: every workspace token
+    is acquired at connect and released on failure/disconnect."""
+
+    def _connect_harness(self, adapter, mock_web_client, acquire_calls):
+        def _fake_acquire(*args, **kwargs):
+            acquire_calls.append(args)
+            return (True, None)
+
+        return (
+            patch.object(_slack_mod, "AsyncApp", return_value=MagicMock()),
+            patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
+            patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()),
+            patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
+            patch("gateway.status.acquire_scoped_lock", side_effect=_fake_acquire),
+            patch("asyncio.create_task"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquires_per_bot_token_locks_multi_workspace(self):
+        config = PlatformConfig(enabled=True, token="xoxb-one,xoxb-two")
+        adapter = SlackAdapter(config)
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(side_effect=[
+            {"team_id": "T1", "user_id": "U1", "user": "b1", "team": "One"},
+            {"team_id": "T2", "user_id": "U2", "user": "b2", "team": "Two"},
+        ])
+        acquire_calls = []
+        patches = self._connect_harness(adapter, mock_web_client, acquire_calls)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            result = await adapter.connect()
+
+        assert result is True
+        bot_identities = [args[1] for args in acquire_calls if args[0] == "slack-bot-token"]
+        # Config tokens are acquired first (saved OAuth tokens, if any,
+        # are appended after them).
+        assert bot_identities[:2] == ["xoxb-one", "xoxb-two"]
+        assert adapter._bot_token_lock_identities[:2] == ["xoxb-one", "xoxb-two"]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_releases_bot_token_locks(self):
+        config = PlatformConfig(enabled=True, token="xoxb-one,xoxb-two")
+        adapter = SlackAdapter(config)
+        adapter._running = True
+        adapter._handler = None
+        adapter._bot_token_lock_identities = ["xoxb-one", "xoxb-two"]
+        adapter._platform_lock_identity = ("slack-app-token", "xapp-fake")
+
+        with patch("gateway.status.release_scoped_lock") as mock_release:
+            with patch.object(SlackAdapter, "_release_platform_lock") as mock_app_release:
+                await adapter.disconnect()
+
+        mock_release.assert_any_call("slack-bot-token", "xoxb-one")
+        mock_release.assert_any_call("slack-bot-token", "xoxb-two")
+        mock_app_release.assert_called_once()
+        assert adapter._bot_token_lock_identities == []
 
 
 # ---------------------------------------------------------------------------

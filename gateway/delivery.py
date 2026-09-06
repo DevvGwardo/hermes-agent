@@ -41,6 +41,11 @@ class DeliveryTarget:
     thread_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
+    # Raw target string when the platform name is unknown.  The platform
+    # falls back to LOCAL for routing, but the original name is preserved
+    # so deliver() can report {success: False, error: unknown_platform}
+    # instead of silently misrouting to local files.
+    unknown_platform: Optional[str] = None
     
     @classmethod
     def parse(cls, target: str, origin: Optional[SessionSource] = None) -> "DeliveryTarget":
@@ -82,21 +87,27 @@ class DeliveryTarget:
                 platform = Platform(platform_str)
                 return cls(platform=platform, chat_id=chat_id, thread_id=thread_id, is_explicit=True)
             except ValueError:
-                # Unknown platform, treat as local
-                return cls(platform=Platform.LOCAL)
+                # Unknown platform — fall back to LOCAL for routing but
+                # preserve the raw target so deliver() reports
+                # unknown_platform instead of silently saving locally.
+                return cls(platform=Platform.LOCAL, unknown_platform=target_stripped)
         
         # Just a platform name (use home channel)
         try:
             platform = Platform(target_lower)
             return cls(platform=platform)
         except ValueError:
-            # Unknown platform, treat as local
-            return cls(platform=Platform.LOCAL)
-    
+            # Unknown platform — fall back to LOCAL for routing but
+            # preserve the raw target so deliver() reports
+            # unknown_platform instead of silently saving locally.
+            return cls(platform=Platform.LOCAL, unknown_platform=target_stripped)
+
     def to_string(self) -> str:
         """Convert back to string format."""
         if self.is_origin:
             return "origin"
+        if self.unknown_platform:
+            return self.unknown_platform
         if self.platform == Platform.LOCAL:
             return "local"
         if self.chat_id and self.thread_id:
@@ -150,6 +161,12 @@ class DeliveryRouter:
         results = {}
         
         for target in targets:
+            if target.unknown_platform:
+                results[target.to_string()] = {
+                    "success": False,
+                    "error": f"unknown_platform: {target.unknown_platform}",
+                }
+                continue
             try:
                 if target.platform == Platform.LOCAL:
                     result = self._deliver_local(content, job_id, job_name, metadata)
