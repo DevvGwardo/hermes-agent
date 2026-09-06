@@ -310,7 +310,14 @@ export const opsCommands: SlashCommand[] = [
         return
       }
 
-      patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 })
+      // 'tree' opens the subagent spawn-tree dashboard
+      if (sub === 'tree') {
+        patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 })
+        return
+      }
+
+      // Default: open the multi-session agent list view
+      patchOverlayState({ agentList: true })
     }
   },
 

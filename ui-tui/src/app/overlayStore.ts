@@ -4,6 +4,7 @@ import type { OverlayState } from './interfaces.js'
 
 const buildOverlayState = (): OverlayState => ({
   agents: false,
+  agentList: false,
   agentsInitialHistoryIndex: 0,
   approval: null,
   clarify: null,
@@ -20,8 +21,8 @@ export const $overlayState = atom<OverlayState>(buildOverlayState())
 
 export const $isBlocked = computed(
   $overlayState,
-  ({ agents, approval, clarify, confirm, modelPicker, pager, picker, secret, skillsHub, sudo }) =>
-    Boolean(agents || approval || clarify || confirm || modelPicker || pager || picker || secret || skillsHub || sudo)
+  ({ agentList, agents, approval, clarify, confirm, modelPicker, pager, picker, secret, skillsHub, sudo }) =>
+    Boolean(agentList || agents || approval || clarify || confirm || modelPicker || pager || picker || secret || skillsHub || sudo)
 )
 
 export const getOverlayState = () => $overlayState.get()
@@ -43,6 +44,7 @@ export const resetOverlayState = () => $overlayState.set(buildOverlayState())
 export const resetFlowOverlays = () =>
   $overlayState.set({
     ...buildOverlayState(),
+    agentList: $overlayState.get().agentList,
     agents: $overlayState.get().agents,
     agentsInitialHistoryIndex: $overlayState.get().agentsInitialHistoryIndex,
     modelPicker: $overlayState.get().modelPicker,

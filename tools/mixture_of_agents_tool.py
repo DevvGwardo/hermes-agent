@@ -71,6 +71,97 @@ REFERENCE_MODELS = [
 # Prefer the strongest synthesis model in the current OpenRouter lineup.
 AGGREGATOR_MODEL = "anthropic/claude-opus-4.6"
 
+
+# --- Cursor Composer dispatch (Mixture-of-Agents -> Composer's MOE) -----------
+# Minimal env-driven shim so users can wire cursor:composer-2.5 into MoA.
+# Latency: blocking single-shot -- see agent/transports/cursor_composer.py docstring.
+import json as _moa_json
+from agent.transports.cursor_composer import (
+    CursorComposerProvider as _CursorComposerProvider,
+    looks_like_cursor_model as _looks_like_cursor_model,
+)
+
+
+def _moa_parse_env_list(env_value):
+    if not env_value:
+        return None
+    raw = env_value.strip()
+    try:
+        parsed = _moa_json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        if isinstance(parsed, str):
+            return [parsed]
+    except Exception:
+        pass
+    parts = [p.strip() for p in raw.split(',') if p.strip()]
+    return parts or None
+
+
+def _moa_env_references():
+    return _moa_parse_env_list(__import__('os').environ.get('HERMES_MOA_REFERENCES'))
+
+
+def _moa_env_aggregator():
+    v = __import__('os').environ.get('HERMES_MOA_AGGREGATOR')
+    return v.strip() if v else None
+
+
+def _moa_env_cursor_config():
+    import os as _os
+    cfg = {}
+    api_key = _os.environ.get('HERMES_CURSOR_API_KEY') or _os.environ.get('CURSOR_API_KEY')
+    if api_key:
+        cfg['api_key'] = api_key
+    workspace = _os.environ.get('HERMES_CURSOR_WORKSPACE')
+    if workspace:
+        cfg['workspace'] = workspace
+    model = _os.environ.get('HERMES_CURSOR_MODEL')
+    if model:
+        cfg['model'] = model
+    extra = _os.environ.get('HERMES_CURSOR_EXTRA_ARGS')
+    if extra:
+        cfg['extra_args'] = [a.strip() for a in extra.split(' ') if a.strip()]
+    timeout = _os.environ.get('HERMES_CURSOR_TIMEOUT')
+    if timeout and timeout.isdigit():
+        cfg['timeout_seconds'] = int(timeout)
+    return cfg
+
+
+async def _moa_dispatch_reference_model(model, user_prompt, temperature):
+    if _looks_like_cursor_model(model):
+        try:
+            provider = _CursorComposerProvider.from_config(_moa_env_cursor_config())
+            text = await provider.complete_text([
+                {'role': 'user', 'content': user_prompt},
+            ])
+            return text, True
+        except Exception as exc:
+            logger.warning('Cursor reference dispatch failed for %s: %s', model, exc)
+            return '', False
+    return await _run_reference_model_safe(model, user_prompt, temperature)
+
+
+async def _moa_dispatch_aggregator(system_prompt, user_prompt, temperature,
+                                   max_tokens=None, model=None):
+    if _looks_like_cursor_model(model):
+        try:
+            provider = _CursorComposerProvider.from_config(_moa_env_cursor_config())
+            messages = []
+            if system_prompt:
+                messages.append({'role': 'system', 'content': system_prompt})
+            messages.append({'role': 'user', 'content': user_prompt})
+            text = await provider.complete_text(messages)
+            # Match `_run_aggregator_model`'s -> str contract.
+            return text
+        except Exception as exc:
+            logger.warning('Cursor aggregator dispatch failed for %s: %s', model, exc)
+            raise
+    return await _run_aggregator_model(
+        system_prompt, user_prompt, temperature, max_tokens=max_tokens
+    )
+
+
 # Temperature settings optimized for MoA performance
 REFERENCE_TEMPERATURE = 0.6  # Balanced creativity for diverse perspectives
 AGGREGATOR_TEMPERATURE = 0.4  # Focused synthesis for consistency
@@ -303,15 +394,15 @@ async def mixture_of_agents_tool(
             raise ValueError("OPENROUTER_API_KEY environment variable not set")
         
         # Use provided models or defaults
-        ref_models = reference_models or REFERENCE_MODELS
-        agg_model = aggregator_model or AGGREGATOR_MODEL
+        ref_models = reference_models or _moa_env_references() or REFERENCE_MODELS
+        agg_model = aggregator_model or _moa_env_aggregator() or AGGREGATOR_MODEL
         
         logger.info("Using %s reference models in 2-layer MoA architecture", len(ref_models))
         
         # Layer 1: Generate diverse responses from reference models (with failure handling)
         logger.info("Layer 1: Generating reference responses...")
         model_results = await asyncio.gather(*[
-            _run_reference_model_safe(model, user_prompt, REFERENCE_TEMPERATURE)
+            _moa_dispatch_reference_model(model, user_prompt, REFERENCE_TEMPERATURE)
             for model in ref_models
         ])
         
@@ -348,11 +439,12 @@ async def mixture_of_agents_tool(
             successful_responses
         )
         
-        final_response = await _run_aggregator_model(
-            aggregator_system_prompt,
-            user_prompt,
-            AGGREGATOR_TEMPERATURE
-        )
+        final_response = await _moa_dispatch_aggregator(
+        aggregator_system_prompt,
+        user_prompt,
+        AGGREGATOR_TEMPERATURE,
+        model=agg_model,
+    )
         
         # Calculate processing time
         end_time = datetime.datetime.now()

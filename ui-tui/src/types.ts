@@ -147,6 +147,8 @@ export interface SessionInfo {
   mcp_servers?: McpServerStatus[]
   model: string
   reasoning_effort?: string
+  ultracode_mode?: boolean
+  max_effort_mode?: boolean
   release_date?: string
   service_tier?: string
   skills: Record<string, string[]>

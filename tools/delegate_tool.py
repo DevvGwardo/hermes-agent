@@ -203,6 +203,34 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
+def steer_subagent(subagent_id: str, goal: str) -> bool:
+    """Redirect a running subagent's goal by injecting a steer into its loop.
+
+    Calls the child's thread-safe ``AIAgent.steer(goal)`` — the same
+    mechanism the parent agent's ``/steer`` uses — so the model sees the new
+    direction after its next tool batch. Returns True when a matching live
+    subagent was found and accepted the steer.
+
+    Unlike :func:`interrupt_subagent`, this does NOT stop the child; it
+    reframes the work already in flight (the chief-of-staff "control agents"
+    surface beyond start / pause / kill).
+    """
+    if not goal or not goal.strip():
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+    if not record:
+        return False
+    agent = record.get("agent")
+    if agent is None or not hasattr(agent, "steer"):
+        return False
+    try:
+        return bool(agent.steer(goal))
+    except Exception as exc:
+        logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
+        return False
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -2309,7 +2337,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         )
 
     return {
-        "model": configured_model,
+        "model": configured_model or runtime.get("model") or None,
         "provider": runtime.get("provider"),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,

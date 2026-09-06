@@ -1,4 +1,5 @@
 import { Box, NoSelect, ScrollBox, type ScrollBoxHandle, Text, useInput, useStdout } from '@hermes/ink'
+import { TextInput } from './textInput.js'
 import { useStore } from '@nanostores/react'
 import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 
@@ -12,7 +13,7 @@ import { patchOverlayState } from '../app/overlayStore.js'
 import { $spawnDiff, $spawnHistory, clearDiffPair, type SpawnSnapshot } from '../app/spawnHistoryStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import type { DelegationPauseResponse, DelegationStatusResponse, SubagentInterruptResponse } from '../gatewayTypes.js'
+import type { DelegationPauseResponse, DelegationStatusResponse, SubagentInterruptResponse, SubagentSteerResponse } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
 import {
   buildSubagentTree,
@@ -818,6 +819,31 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
         .catch(() => setFlash('pause failed'))
     })
 
+  const [steerTarget, setSteerTarget] = useState<null | string>(null)
+  const [steerGoal, setSteerGoal] = useState('')
+
+  const steerOne = (id: string) =>
+    guardLive(() => {
+      setSteerGoal('')
+      setSteerTarget(id)
+    })
+
+  const doSteer = (id: string, goal: string) => {
+    const trimmed = goal.trim()
+    setSteerTarget(null)
+    setSteerGoal('')
+    if (!trimmed) {
+      setFlash('steer cancelled')
+      return
+    }
+    gw.request<SubagentSteerResponse>('subagent.steer', { subagent_id: id, goal: trimmed })
+      .then(raw => {
+        const r = asRpcResult<SubagentSteerResponse>(raw)
+        setFlash(r?.found ? `steering ${id}` : `not found: ${id}`)
+      })
+      .catch(() => setFlash(`steer failed: ${id}`))
+  }
+
   const stepHistory = (delta: -1 | 1) =>
     setHistoryIndex(idx => {
       const next = Math.max(0, Math.min(history.length, idx + delta))
@@ -842,6 +868,15 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
   const scrollDetail = (dy: number) => detailScrollRef.current?.scrollBy(dy)
 
   useInput((ch, key) => {
+    if (steerTarget) {
+      if (key.escape) {
+        setSteerTarget(null)
+        setSteerGoal('')
+        setFlash('steer cancelled')
+      }
+      return
+    }
+
     if (ch === 'q') {
       return closeWithCleanup()
     }
@@ -939,6 +974,10 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
     if (ch === 'f') {
       return setFilter(m => cycle(FILTER_ORDER, m))
     }
+
+    if (ch === 'r' && selected) {
+      return steerOne(selected.item.id)
+    }
   })
 
   // ── Header assembly ────────────────────────────────────────────────
@@ -971,7 +1010,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
 
   const controlsHint = replayMode
     ? ' · controls locked'
-    : ` · x kill · X subtree · p ${delegation.paused ? 'resume' : 'pause'}`
+    : ` · x kill · X subtree · r redirect · p ${delegation.paused ? 'resume' : 'pause'}`
 
   // ── Rendering ──────────────────────────────────────────────────────
 
@@ -1046,6 +1085,18 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
             ↑↓/jk scroll · PgUp/PgDn page · g/G top/bottom · Esc/← back to list{controlsHint} · q close
           </Text>
         )}
+        {steerTarget ? (
+          <Box flexDirection="column" marginTop={1}>
+            <Text color={t.color.label}>{`⏩ steer ${steerTarget} → `}</Text>
+            <TextInput
+              columns={Math.max(20, cols - 8)}
+              value={steerGoal}
+              onChange={setSteerGoal}
+              onSubmit={(g) => doSteer(steerTarget, g)}
+            />
+            <Text color={t.color.muted}>Enter send · Esc cancel</Text>
+          </Box>
+        ) : null}
       </Box>
     </Box>
   )

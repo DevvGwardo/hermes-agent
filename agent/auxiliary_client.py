@@ -1149,10 +1149,10 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 
-def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter(explicit_api_key: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
-        or_key = _pool_runtime_api_key(entry)
+        or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if not or_key:
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
@@ -1160,7 +1160,7 @@ def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
         return OpenAI(api_key=or_key, base_url=base_url,
                        default_headers=_OR_HEADERS), _OPENROUTER_MODEL
 
-    or_key = os.getenv("OPENROUTER_API_KEY")
+    or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
@@ -1946,7 +1946,36 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
-    """Central router: given a provider name and optional model, return a
+    """    # --- Cursor Composer (single-shot) ------------------------------------------
+    # `provider: cursor` is recognized so configs that reference it don't silently
+    # fall through to OpenRouter. The actual usage path today is Mixture-of-Agents;
+    # the returned provider is a CursorComposerProvider with no OpenAI-shaped shim,
+    # so callers that try `client.chat.completions.create(...)` will fail loudly
+    # rather than corruptively fall through.
+    if (provider or '').strip().lower() == 'cursor':
+        try:
+            from agent.transports.cursor_composer import (
+                CursorComposerProvider as _CursorCCP,
+            )
+            from agent.transports.cursor_composer import (
+                DEFAULT_MODEL as _CURSOR_DEFAULT_MODEL,
+            )
+        except Exception as _cursor_import_err:  # pragma: no cover -- defensive
+            logger = logging.getLogger(__name__)
+            logger.error('cursor_composer provider not importable: %s', _cursor_import_err)
+            return None, None
+        cfg = (main_runtime or {}).get('cursor', {}) if isinstance(main_runtime, dict) else {}
+        resolved = (model or cfg.get('model') or _CURSOR_DEFAULT_MODEL).replace('cursor:', '').replace('cursor/', '')
+        if not resolved:
+            resolved = _CURSOR_DEFAULT_MODEL
+        return _CursorCCP.from_config({
+            'model': resolved,
+            'workspace': cfg.get('workspace'),
+            'api_key': explicit_api_key or cfg.get('api_key'),
+            'extra_args': cfg.get('extra_args'),
+            'timeout_seconds': cfg.get('timeout_seconds'),
+        }), resolved
+Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
 
     The returned client always exposes ``.chat.completions.create()`` — for
@@ -1977,6 +2006,12 @@ def resolve_provider_client(
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
     _validate_proxy_env_urls()
+    # Preserve the original provider name before alias normalization so a
+    # user-declared ``custom_providers`` entry whose name coincidentally
+    # matches a built-in alias (e.g. user names their custom provider "kimi"
+    # which aliases to "kimi-coding") is still reachable via the named-custom
+    # branch below.
+    original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
@@ -2047,9 +2082,9 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
-    # ── OpenRouter ───────────────────────────────────────────────────
+    # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter()
+        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
@@ -2163,7 +2198,18 @@ def resolve_provider_client(
     # ── Named custom providers (config.yaml providers dict / custom_providers list) ───
     try:
         from hermes_cli.runtime_provider import _get_named_custom_provider
-        custom_entry = _get_named_custom_provider(provider)
+        # When the raw requested name is an alias (``kimi`` → ``kimi-coding``)
+        # and the user defined a ``custom_providers`` entry under that alias
+        # name, the custom entry is the intended target — the built-in alias
+        # rewriting would otherwise hijack the request.  Only preferred when
+        # the raw name is an alias (not a canonical provider name) so custom
+        # entries that coincidentally match a canonical provider (e.g. ``nous``)
+        # still defer to the built-in per `_get_named_custom_provider`'s guard.
+        custom_entry = None
+        if original_provider and original_provider != provider:
+            custom_entry = _get_named_custom_provider(original_provider)
+        if custom_entry is None:
+            custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
             custom_base = custom_entry.get("base_url", "").strip()
             custom_key = custom_entry.get("api_key", "").strip()
@@ -2273,6 +2319,12 @@ def resolve_provider_client(
 
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
+        # Honour an explicit api_key override (e.g. from a fallback_model entry
+        # or a custom_providers entry) so callers that pass an explicit
+        # credential can authenticate against endpoints where no built-in
+        # credential is registered for this provider alias.
+        if explicit_api_key:
+            api_key = explicit_api_key.strip() or api_key
         if not api_key:
             tried_sources = list(pconfig.api_key_env_vars)
             if provider == "copilot":
@@ -2284,6 +2336,11 @@ def resolve_provider_client(
 
         raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
         base_url = _to_openai_base_url(raw_base_url)
+        # Honour an explicit base_url override from the caller — used when a
+        # fallback_model entry (or custom_providers lookup) routes through a
+        # built-in provider name but targets a user-specified endpoint.
+        if explicit_base_url:
+            base_url = _to_openai_base_url(explicit_base_url.strip().rstrip("/"))
 
         default_model = _API_KEY_PROVIDER_AUX_MODELS.get(provider, "")
         final_model = _normalize_resolved_model(model or default_model, provider)
@@ -3209,7 +3266,26 @@ def _build_call_kwargs(
             kwargs["max_tokens"] = max_tokens
 
     if tools:
-        kwargs["tools"] = tools
+        # Defensive dedup: providers like Google Vertex, Azure, and Bedrock
+        # reject requests with duplicate tool names (HTTP 400).  The upstream
+        # injection paths (run_agent.py) already dedup, but this guard
+        # converts a hard API failure into a warning if an upstream regression
+        # reintroduces duplicates.  See: #18478
+        _seen: set = set()
+        _deduped: list = []
+        for _t in tools:
+            _tname = (_t.get("function") or {}).get("name", "")
+            if _tname and _tname in _seen:
+                logger.warning(
+                    "_build_call_kwargs: duplicate tool name '%s' removed "
+                    "(provider=%s model=%s)",
+                    _tname, provider, model,
+                )
+                continue
+            if _tname:
+                _seen.add(_tname)
+            _deduped.append(_t)
+        kwargs["tools"] = _deduped
 
     # Provider-specific extra_body
     merged_extra = dict(extra_body or {})

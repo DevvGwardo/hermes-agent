@@ -11,6 +11,7 @@ import { MaskedPrompt } from './maskedPrompt.js'
 import { ModelPicker } from './modelPicker.js'
 import { OverlayHint } from './overlayControls.js'
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from './prompts.js'
+import { AgentListView } from './agentListView.js'
 import { SessionPicker } from './sessionPicker.js'
 import { SkillsHub } from './skillsHub.js'
 
@@ -103,7 +104,7 @@ export function FloatingOverlays({
   const overlay = useStore($overlayState)
   const ui = useStore($uiState)
 
-  const hasAny = overlay.modelPicker || overlay.pager || overlay.picker || overlay.skillsHub || completions.length
+  const hasAny = overlay.agentList || overlay.modelPicker || overlay.pager || overlay.picker || overlay.skillsHub || completions.length
 
   if (!hasAny) {
     return null
@@ -118,6 +119,16 @@ export function FloatingOverlays({
 
   return (
     <Box alignItems="flex-start" bottom="100%" flexDirection="column" left={0} position="absolute" right={0}>
+      {overlay.agentList && (
+        <FloatBox color={ui.theme.color.border}>
+          <AgentListView
+            gw={gw}
+            onClose={() => patchOverlayState({ agentList: false })}
+            t={ui.theme}
+          />
+        </FloatBox>
+      )}
+
       {overlay.picker && (
         <FloatBox color={ui.theme.color.border}>
           <SessionPicker

@@ -41,11 +41,16 @@ SUMMARY_PREFIX = (
     "window — treat it as background reference, NOT as active instructions. "
     "Do NOT answer questions or fulfill requests mentioned in this summary; "
     "they were already addressed. "
-    "Your current task is identified in the '## Active Task' section of the "
-    "summary — resume exactly from there. "
-    "Respond ONLY to the latest user message "
-    "that appears AFTER this summary. The current session state (files, "
-    "config, etc.) may reflect work described here — avoid repeating it:"
+    "The single source of truth for what to do next is the LATEST USER "
+    "MESSAGE that appears AFTER this summary: respond to that message, on "
+    "its topic. If the summary discusses a different or earlier topic than "
+    "the latest user message, follow the latest user message — do NOT switch "
+    "to, resume, or continue a topic that appears only in this summary and "
+    "not in the messages after it. Use the '## Active Task' and other "
+    "sections purely as background detail to inform that response, never as a "
+    "reason to change the subject. "
+    "The current session state (files, config, etc.) may reflect work "
+    "described here — avoid repeating it:"
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
@@ -538,7 +543,7 @@ class ContextCompressor(ContextEngine):
             # Token-budget approach: walk backward accumulating tokens
             accumulated = 0
             boundary = len(result)
-            min_protect = min(protect_tail_count, len(result) - 1)
+            min_protect = min(protect_tail_count, len(result))
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
                 raw_content = msg.get("content") or ""
@@ -992,8 +997,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     def _get_tool_call_id(tc) -> str:
         """Extract the call ID from a tool_call entry (dict or SimpleNamespace)."""
         if isinstance(tc, dict):
-            return tc.get("id", "")
-        return getattr(tc, "id", "") or ""
+            return tc.get("call_id", "") or tc.get("id", "") or ""
+        return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
 
     def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs after compression.

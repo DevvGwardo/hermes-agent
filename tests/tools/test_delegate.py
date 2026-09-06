@@ -32,6 +32,10 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    interrupt_subagent,
+    steer_subagent,
+    _register_subagent,
+    _unregister_subagent,
 )
 
 
@@ -785,6 +789,26 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "sk-or-test-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
         mock_resolve.assert_called_once_with(requested="openrouter")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_resolution_uses_runtime_model_when_config_model_missing(self, mock_resolve):
+        """Named providers should propagate their runtime default model to children."""
+        mock_resolve.return_value = {
+            "provider": "custom",
+            "base_url": "https://my-server.example/v1",
+            "api_key": "sk-test-key",
+            "api_mode": "chat_completions",
+            "model": "server-default-model",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"provider": "custom:my-server", "model": ""}
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["model"], "server-default-model")
+        self.assertEqual(creds["provider"], "custom")
+        self.assertEqual(creds["base_url"], "https://my-server.example/v1")
+        mock_resolve.assert_called_once_with(requested="custom:my-server")
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
@@ -2381,6 +2405,50 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertEqual(seen, [_subagent_auto_deny])
         # Parent's callback slot is still empty (TLS isolates threads).
         self.assertIsNone(_get_approval_callback())
+
+
+class TestSubagentSteer(unittest.TestCase):
+    """Live re-goal of a running child via ``steer_subagent``."""
+
+    def setUp(self):
+        self._registered = []
+
+    def _register(self, sid: str, agent):
+        rec = {"subagent_id": sid, "agent": agent}
+        _register_subagent(rec)
+        self._registered.append(sid)
+
+    def tearDown(self):
+        for sid in self._registered:
+            _unregister_subagent(sid)
+
+    def test_steer_redirects_child_goal(self):
+        agent = MagicMock()
+        agent.steer.return_value = True
+        self._register("sa-steer-1", agent)
+        ok = steer_subagent("sa-steer-1", "new direction")
+        self.assertTrue(ok)
+        agent.steer.assert_called_once_with("new direction")
+
+    def test_steer_empty_goal_rejected(self):
+        agent = MagicMock()
+        self._register("sa-steer-2", agent)
+        self.assertFalse(steer_subagent("sa-steer-2", "   "))
+        agent.steer.assert_not_called()
+
+    def test_steer_unknown_id_returns_false(self):
+        self.assertFalse(steer_subagent("does-not-exist", "goal"))
+
+    def test_steer_missing_agent_returns_false(self):
+        # Record present but no live agent object (e.g. already torn down).
+        self._register("sa-steer-3", None)
+        self.assertFalse(steer_subagent("sa-steer-3", "goal"))
+
+    def test_interrupt_still_works(self):
+        agent = MagicMock()
+        self._register("sa-int-1", agent)
+        self.assertTrue(interrupt_subagent("sa-int-1"))
+        agent.interrupt.assert_called_once()
 
 
 if __name__ == "__main__":

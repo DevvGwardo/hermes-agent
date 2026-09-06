@@ -302,7 +302,10 @@ export interface ToolsConfigureResponse {
 // ── Model picker ─────────────────────────────────────────────────────
 
 export interface ModelOptionProvider {
+  auth_type?: string
+  authenticated?: boolean
   is_current?: boolean
+  key_env?: string
   models?: string[]
   name: string
   slug: string
@@ -419,6 +422,11 @@ export interface SubagentInterruptResponse {
   subagent_id?: string
 }
 
+export interface SubagentSteerResponse {
+  found?: boolean
+  subagent_id?: string
+}
+
 // ── Spawn-tree snapshots ─────────────────────────────────────────────
 
 export interface SpawnTreeListEntry {
@@ -507,3 +515,30 @@ export type GatewayEvent =
       type: 'message.complete'
     }
   | { payload?: { message?: string }; session_id?: string; type: 'error' }
+
+
+export interface AgentSessionItem {
+  session_key: string
+  session_id: string
+  status: 'done' | 'error' | 'idle' | 'queued' | 'running' | 'starting' | 'waiting'
+  model: string
+  source: string
+  title: string
+  preview: string
+  elapsed: number
+  last_active: number
+  message_count: number
+  is_current: boolean
+  has_pending_approval: boolean
+  queued_count: number
+}
+
+export interface AgentListResponse {
+  sessions?: AgentSessionItem[]
+}
+
+export interface AgentPeekResponse {
+  session_id: string
+  exchange?: any[]
+  message_count: number
+}

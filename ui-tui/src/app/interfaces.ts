@@ -70,6 +70,7 @@ export interface GatewayProviderProps {
 
 export interface OverlayState {
   agents: boolean
+  agentList: boolean
   agentsInitialHistoryIndex: number
   approval: ApprovalReq | null
   clarify: ClarifyReq | null
