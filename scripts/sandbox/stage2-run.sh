@@ -47,10 +47,6 @@ if [ "$home_parent" != / ]; then
 fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
-node_env=()
-if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
-fi
 electron_env=()
 if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
   electron_env+=(
@@ -88,6 +84,18 @@ if [ -d /nix ] && [[ "$(readlink -f "$DEV_SANDBOX_BASH")" == /nix/* ]]; then
   USE_HOST_RUNTIME=false
 else
   USE_HOST_RUNTIME=true
+fi
+
+# Host node dir -> sandbox npm: only when the host tree is visible inside the
+# sandbox. Nix binds /nix itself (above); the FHS path binds /usr read-only,
+# but the node dir may live elsewhere (homebrew, nvm, /usr/local subpaths are
+# NOT all covered), and node-gyp reading the HOST's common.gypi through a
+# dangled npm_config_nodedir is fatal for any native postinstall (node-pty:
+# `gyp: /usr/local/common.gypi not found`). So: pass the dir through on Nix,
+# drop it on FHS and let the sandbox's own managed Node win.
+node_env=()
+if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ] && [ "$USE_HOST_RUNTIME" = false ]; then
+  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
 fi
 
 runtime_mounts=()
@@ -216,7 +224,7 @@ exec bwrap \
   --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
   --setenv SSL_CERT_FILE /work/certs/ca.pem \
   --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
-  --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
+  --setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \

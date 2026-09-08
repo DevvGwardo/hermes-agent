@@ -2327,10 +2327,28 @@ install_node_deps() {
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
         # Capture npm output so failures are diagnosable (#87340).
-        local npm_log
-        npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$npm_log" 2>&1; then
+        # --silent also suppresses FATAL errors (a failed run writes a 0-byte
+        # log), so add --loglevel=error: success stays quiet, failure is
+        # actually captured.
+        # Two attempts: node-pty's postinstall can rebuild from source behind
+        # a proxy, and node-gyp's bundled undici intermittently dies on an
+        # abrupt socket FIN (assert(!this.paused)) — a transport race, not a
+        # broken tree, so one retry absorbs it.
+        local npm_log attempt
+        for attempt in 1 2; do
+            npm_log="$(mktemp)"
+            if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent --loglevel=error \
+                    >"$npm_log" 2>&1; then
+                rm -f "$npm_log"
+                npm_log=""
+                break
+            fi
+            if [ "$attempt" -lt 2 ]; then
+                log_info "npm install failed (attempt $attempt) — retrying once..."
+                sleep 3
+            fi
+        done
+        if [ -n "$npm_log" ]; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
                 log_error "npm output:"
@@ -2340,7 +2358,6 @@ install_node_deps() {
             restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
-        rm -f "$npm_log"
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
@@ -2443,9 +2460,11 @@ install_node_deps() {
         # Report success only on actual success, same as node-deps above
         # (#77003) — and fail the install outright (#85297).
         # Capture npm output so failures are diagnosable (#87340).
+        # --silent also suppresses FATAL errors (0-byte log), so add
+        # --loglevel=error the same as the root install above.
         local tui_npm_log
         tui_npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent --loglevel=error \
                 >"$tui_npm_log" 2>&1; then
             log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
             if [ -s "$tui_npm_log" ]; then
