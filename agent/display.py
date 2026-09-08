@@ -1635,9 +1635,9 @@ def get_active_brain_agents(room: str = None) -> list:
                 continue
             # Skip dead processes
             if s.pid:
-                try:
-                    os.kill(s.pid, 0)
-                except OSError:
+                from gateway.status import _pid_exists
+
+                if not _pid_exists(s.pid):
                     continue
             agents.append(s)
 
