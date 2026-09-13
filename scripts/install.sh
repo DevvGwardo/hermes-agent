@@ -2674,10 +2674,27 @@ install_node_deps() {
         # Scoped to the workspaces a CLI install needs so apps/desktop's
         # node-pty is never built here — see node_deps_workspace_args().
         node_deps_workspace_args "$INSTALL_DIR"
-        local npm_log
-        npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install "${NODE_DEPS_WORKSPACE_ARGS[@]}" --silent \
-                >"$npm_log" 2>&1; then
+        # --silent also suppresses FATAL errors (a failed run writes a 0-byte
+        # log), so add --loglevel=error: success stays quiet, failure is
+        # actually captured. Two attempts: node-pty's postinstall can rebuild
+        # from source behind a proxy, and node-gyp's bundled undici
+        # intermittently dies on an abrupt socket FIN — a transport race, not
+        # a broken tree, so one retry absorbs it.
+        local npm_log="" attempt
+        for attempt in 1 2; do
+            npm_log="$(mktemp)"
+            if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install "${NODE_DEPS_WORKSPACE_ARGS[@]}" --silent --loglevel=error \
+                    >"$npm_log" 2>&1; then
+                rm -f "$npm_log"
+                npm_log=""
+                break
+            fi
+            if [ "$attempt" -lt 2 ]; then
+                log_info "npm install failed (attempt $attempt) — retrying once..."
+                sleep 3
+            fi
+        done
+        if [ -n "$npm_log" ]; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
                 log_error "npm output:"
@@ -2687,7 +2704,6 @@ install_node_deps() {
             restore_dirty_lockfiles "$INSTALL_DIR"
             return 1
         fi
-        rm -f "$npm_log"
         log_success "Node.js dependencies installed"
 
         # Install Playwright browser + system dependencies.
