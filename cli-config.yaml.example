@@ -1230,6 +1230,11 @@ gateway:
   # isn't running). Explicit per-platform vars like DISCORD_PROXY still apply.
   # trust_env: true
 
+  # Text sent to people who message the bot but aren't approved yet, replacing
+  # the "ask the owner to run `hermes pairing approve …`" line. Placeholders:
+  # {platform}, {code}. Empty = default CLI instructions.
+  # pairing_instructions: "Ask the owner to approve you in the app (code {code})."
+
 # =============================================================================
 # Toolsets
 # =============================================================================
