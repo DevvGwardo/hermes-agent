@@ -564,6 +564,61 @@ Resolve a pending approval for a run that is waiting on a human decision (for ex
 
 MCP trust-gate consent — a write-capable tool on a server configured `trust: untrusted` — surfaces the same way: the run emits an `approval.request` event and parks in `waiting_for_approval` until this endpoint resolves it (`once` runs the tool, `deny` blocks it).
 
+### Interactive prompts: secrets and clarify (opt-in)
+
+A run can pause to ask its client for input — an API key a skill needs, or an answer to the
+agent's `clarify` tool. Plain OpenAI-compatible clients never answer such prompts, so they are
+**opt-in per run**: declare what the client can answer with the
+`X-Hermes-Client-Capabilities` header (comma-separated) or the equivalent
+`client_capabilities` body field on `POST /v1/runs`:
+
+```http
+POST /v1/runs
+X-Hermes-Client-Capabilities: clarify,secret
+
+{"input": "Set up the weather skill", "client_capabilities": ["clarify", "secret"]}
+```
+
+Known values are `secret` and `clarify` (unknown tokens are ignored). Without a declaration,
+behavior is unchanged: the `clarify` tool is not offered, and a skill with a missing key
+reports a "secure secret entry is not available" setup hint. Hosted-room member runs never
+receive these prompts.
+
+**Secrets (`secret`).** When a loaded skill needs an unset environment variable, the run stream
+emits `secret.request` and the agent blocks (up to 5 minutes):
+
+```json
+{"event": "secret.request", "run_id": "run_…", "request_id": "…", "env_var": "WEATHER_API_KEY",
+ "prompt": "Enter your weather API key", "url": "https://example.com/keys", "skill": "weather"}
+```
+
+(`url` appears when the skill declares a provider URL; free-text setup help arrives as `help`.)
+Answer with `POST /v1/runs/{run_id}/secret` `{"request_id": "…", "value": "…"}` — an empty
+`value` skips. The value is saved to the profile's `.env` exactly like the TUI's secure prompt
+and is never echoed in responses, events, or logs; the stream records only
+`secret.responded` `{request_id, skipped}`. On timeout the stream emits `secret.expire`
+`{request_id}` and the skill stays unconfigured.
+
+**Clarify (`clarify`).** The run gets the `clarify` tool. Each call emits `clarify.request`
+with `{request_id, question, choices, multi_select?}`, or for a batch
+`{request_id, questions: [{qid, question, choices, multi_select}]}`. Answer with
+`POST /v1/runs/{run_id}/clarify`:
+
+- single question: `{"request_id": "…", "answer": "staging"}` (empty string skips); for
+  `multi_select` send a JSON array (`["staging", "prod"]`, or its JSON string);
+- batch, per question: `{"request_id": "…", "question_id": "q0", "answer": "…"}` — the
+  response lists the `remaining` question ids and the agent resumes once all are answered;
+  omitting `question_id` answers the whole batch at once
+  (`"answer": {"answers": {"q0": "…", "q1": "…"}}`) or, with an empty answer, cancels it.
+
+Clarify waits follow `agent.clarify_timeout` (default one hour; `0` waits indefinitely) and
+emit `clarify.expire` `{request_id}` on timeout. Both kinds report the open prompt on
+`GET /v1/runs/{run_id}` as `pending_input: {kind, request_id}`, answer only with the run's
+API key (same scope as steer), return 409 when nothing matching is pending, and are released
+by `POST /v1/runs/{run_id}/stop`. `/v1/capabilities` advertises `run_secret_prompts`,
+`run_clarify_prompts`, `client_capabilities_header`, and the `run_secret` / `run_clarify`
+endpoints.
+
 ## Jobs API (background scheduled work)
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.

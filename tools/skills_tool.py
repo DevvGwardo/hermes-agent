@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from contextlib import suppress
+from contextvars import ContextVar, Token
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -100,6 +101,20 @@ def load_env() -> Dict[str, str]:
 def set_secret_capture_callback(callback) -> None:
     global _secret_capture_callback
     _secret_capture_callback = callback
+
+
+# Per-run override for hosts that serve many concurrent runs from one process (API server
+# /v1/runs): the process-global callback above cannot tell runs apart. Wins over the
+# global callback and over the gateway "no secure entry" hint when bound.
+_scoped_secret_capture_callback: ContextVar = ContextVar("scoped_secret_capture_callback", default=None)
+
+
+def bind_scoped_secret_capture_callback(callback) -> Token:
+    return _scoped_secret_capture_callback.set(callback)
+
+
+def reset_scoped_secret_capture_callback(token: Token) -> None:
+    _scoped_secret_capture_callback.reset(token)
 
 
 def _skill_utils_delegate(attr: str):
