@@ -80,7 +80,12 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
     "email": {
         "name": "Email", "description": "Talk to Hermes through an IMAP/SMTP mailbox.",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/",
-        "env_vars": ("EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_IMAP_HOST", "EMAIL_SMTP_HOST"),
+        # EMAIL_ALLOW_ALL_USERS / EMAIL_HOME_ADDRESS are setup-hidden knobs: they land in the
+        # entry's extra_env_vars (settable via PUT, not shown on the setup card).
+        "env_vars": (
+            "EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_IMAP_HOST", "EMAIL_SMTP_HOST", "EMAIL_ALLOWED_USERS",
+            "EMAIL_IMAP_PORT", "EMAIL_SMTP_PORT", "EMAIL_ALLOW_ALL_USERS", "EMAIL_HOME_ADDRESS",
+        ),
         "required_env": ("EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_IMAP_HOST", "EMAIL_SMTP_HOST"),
     },
     "sms": {
@@ -299,16 +304,52 @@ def _discover_platform_env_vars(platform_id: str) -> tuple[str, ...]:
         and any(name.startswith(prefix) for prefix in prefixes)}))
 
 
+def _platform_access_env_vars(platform_id: str, plugin_entry: Any | None) -> tuple[str | None, str | None, str | None]:
+    """``(allowlist, allow_all, home)`` env-var names the gateway actually reads for a platform —
+    the same tables authorization (gateway.pairing / authz_mixin) and home-channel delivery
+    (cron.scheduler_delivery) use, with the plugin registry as fallback. None when not applicable."""
+    from cron.scheduler_delivery import _HOME_TARGET_ENV_VARS
+    from gateway.pairing import _PLATFORM_ALLOWLIST_ENV
+
+    allowlist = _PLATFORM_ALLOWLIST_ENV.get(platform_id) or (
+        getattr(plugin_entry, "allowed_users_env", "") if plugin_entry is not None else "") or None
+    allow_all = (getattr(plugin_entry, "allow_all_env", "") if plugin_entry is not None else "") or (
+        allowlist.replace("_ALLOWED_USERS", "_ALLOW_ALL_USERS") if allowlist else None)
+    home = _HOME_TARGET_ENV_VARS.get(platform_id) or (
+        getattr(plugin_entry, "cron_deliver_env_var", "") if plugin_entry is not None else "") or None
+    return allowlist, allow_all, home
+
+
 def _merge_platform_env_vars(platform_id: str, override: dict[str, Any], plugin_entry: Any | None) -> tuple[str, ...]:
     """Canonical env-var list for a platform card. Required credentials always survive: hiding a
-    required field would make the platform unconfigurable."""
+    required field would make the platform unconfigurable. The platform's allowlist var is always
+    listed (it is the one decision a new user has to make)."""
     discovered = _discover_platform_env_vars(platform_id)
+    allowlist = _platform_access_env_vars(platform_id, plugin_entry)[0]
+    tail = (*discovered, *((allowlist,) if allowlist and not _is_setup_hidden_env(allowlist) else ()))
     if "env_vars" in override:
         explicit = tuple(key for key in override["env_vars"] if not _is_setup_hidden_env(key))
-        return tuple(dict.fromkeys((*explicit, *discovered)))
+        return tuple(dict.fromkeys((*explicit, *tail)))
     if plugin_entry is not None and plugin_entry.required_env:
-        return tuple(dict.fromkeys((*tuple(plugin_entry.required_env), *discovered)))
-    return discovered
+        return tuple(dict.fromkeys((*tuple(plugin_entry.required_env), *tail)))
+    return tuple(dict.fromkeys(tail))
+
+
+def _platform_extra_env_vars(
+        platform_id: str, override: dict[str, Any], plugin_entry: Any | None, card: tuple[str, ...]) -> tuple[str, ...]:
+    """Setup-hidden knobs a platform owns (home channel, allow-all switch, reply mode, proxy, …).
+    Not rendered on the setup card, but ``PUT /api/messaging/platforms/{id}`` accepts them so API
+    clients can set them without the Keys page."""
+    _, allow_all, home = _platform_access_env_vars(platform_id, plugin_entry)
+    prefixes = _platform_env_prefixes(platform_id)
+    hidden_discovered = sorted(
+        name for name, info in OPTIONAL_ENV_VARS.items()
+        if info.get("category") == "messaging" and name not in _MESSAGING_KEYS_PAGE_KEYS
+        and _is_setup_hidden_env(name) and any(name.startswith(prefix) for prefix in prefixes))
+    candidates = (
+        *(key for key in override.get("env_vars", ()) if _is_setup_hidden_env(key)),
+        *(key for key in (home, allow_all) if key), *hidden_discovered)
+    return tuple(key for key in dict.fromkeys(candidates) if key not in card)
 
 
 def _build_catalog_entry(platform_id: str, plugin_entry: Any | None = None) -> dict[str, Any]:
@@ -319,12 +360,14 @@ def _build_catalog_entry(platform_id: str, plugin_entry: Any | None = None) -> d
         required_env = tuple(plugin_entry.required_env or ()) if plugin_entry is not None else ()
     plugin_label = plugin_entry.label if plugin_entry is not None else None
     plugin_hint = (plugin_entry.install_hint or "") if plugin_entry is not None else None
+    env_vars = _merge_platform_env_vars(platform_id, override, plugin_entry)
     return {
         "id": platform_id,
         "name": override.get("name") or plugin_label or platform_id.replace("_", " ").title(),
         "description": override.get("description") or plugin_hint or "",
         "docs_url": override.get("docs_url", ""),
-        "env_vars": _merge_platform_env_vars(platform_id, override, plugin_entry),
+        "env_vars": env_vars,
+        "extra_env_vars": _platform_extra_env_vars(platform_id, override, plugin_entry, env_vars),
         "required_env": required_env,
     }
 
