@@ -68,33 +68,8 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
     which are refused via the canonical read deny-list so the mount surface cannot hand a
     skill what the read surface denies. Fails CLOSED (logged) if the guard is unavailable or raises.
     """
-    resolved = _contained_host_path(
-        relative_path, get_hermes_home(),
-        "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
-        "credential_files: rejected path traversal %r (%s)")
+    resolved = resolve_credential_file(relative_path)
     if resolved is None:
-        return False
-    if not resolved.is_file():
-        logger.debug("credential_files: skipping %s (not found)", resolved)
-        return False
-    # Master credential stores are never mountable, even though they sit inside HERMES_HOME and therefore
-    # pass the containment check above. Fails CLOSED: if the canonical guard can't be consulted we refuse
-    # the mount rather than risk bind-mounting auth.json into a sandbox. The import lives at module top (no
-    # circular-import concern — file_safety is stdlib-only); the sentinel + logger.exception keep guard
-    # failures debuggable instead of silently swallowed (#67665).
-    if get_read_block_error is None:
-        logger.error("credential_files: refusing %r — agent.file_safety could not be "
-                     "imported, so the master-store deny-list cannot be consulted", relative_path)
-        return False
-    try:
-        denied = get_read_block_error(str(resolved))
-    except Exception:
-        logger.exception("credential_files: refusing %r — read guard raised", relative_path)
-        return False
-    if denied:
-        logger.warning("credential_files: refused %r — it is a credential store the agent "
-                       "is denied from reading; a skill may mount its own service token, "
-                       "not the master key files", relative_path)
         return False
 
     container_path = f"{container_base.rstrip('/')}/{relative_path}"
@@ -103,18 +78,66 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
     return True
 
 
-def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> List[str]:
-    """Register skill-frontmatter entries (str or dict with ``path``); return missing paths."""
-    missing = []
+def resolve_credential_file(relative_path: str) -> Optional[Path]:
+    """Resolved host path of a mountable HERMES_HOME-relative credential file, else None.
+
+    Side-effect free: the same checks ``register_credential_file`` applies (containment,
+    existence, master-store deny-list), without registering anything — readiness probes
+    (the dashboard's skill list) use it to report missing files.
+    """
+    resolved = _contained_host_path(
+        relative_path, get_hermes_home(),
+        "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
+        "credential_files: rejected path traversal %r (%s)")
+    if resolved is None:
+        return None
+    if not resolved.is_file():
+        logger.debug("credential_files: skipping %s (not found)", resolved)
+        return None
+    # Master credential stores are never mountable, even though they sit inside HERMES_HOME and therefore
+    # pass the containment check above. Fails CLOSED: if the canonical guard can't be consulted we refuse
+    # the mount rather than risk bind-mounting auth.json into a sandbox. The import lives at module top (no
+    # circular-import concern — file_safety is stdlib-only); the sentinel + logger.exception keep guard
+    # failures debuggable instead of silently swallowed (#67665).
+    if get_read_block_error is None:
+        logger.error("credential_files: refusing %r — agent.file_safety could not be "
+                     "imported, so the master-store deny-list cannot be consulted", relative_path)
+        return None
+    try:
+        denied = get_read_block_error(str(resolved))
+    except Exception:
+        logger.exception("credential_files: refusing %r — read guard raised", relative_path)
+        return None
+    if denied:
+        logger.warning("credential_files: refused %r — it is a credential store the agent "
+                       "is denied from reading; a skill may mount its own service token, "
+                       "not the master key files", relative_path)
+        return None
+    return resolved
+
+
+def _credential_entry_paths(entries: list) -> Iterator[str]:
+    """Relative paths from skill-frontmatter entries (str or dict with ``path``/``name``)."""
     for entry in entries:
         if isinstance(entry, dict):
             entry = entry.get("path") or entry.get("name") or ""
         elif not isinstance(entry, str):
             continue
-        rel_path = entry.strip()
-        if rel_path and not register_credential_file(rel_path, container_base):
-            missing.append(rel_path)
-    return missing
+        if rel_path := str(entry).strip():
+            yield rel_path
+
+
+def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> List[str]:
+    """Register skill-frontmatter entries (str or dict with ``path``); return missing paths."""
+    return [rel_path for rel_path in _credential_entry_paths(entries)
+            if not register_credential_file(rel_path, container_base)]
+
+
+def missing_credential_files(entries: list) -> List[str]:
+    """Paths from skill-frontmatter entries that ``register_credential_files`` would report
+    missing — computed without registering anything (read-only readiness probe)."""
+    return [rel_path for rel_path in _credential_entry_paths(entries)
+            if resolve_credential_file(rel_path) is None]
 
 
 def _load_config_files() -> List[Dict[str, str]]:

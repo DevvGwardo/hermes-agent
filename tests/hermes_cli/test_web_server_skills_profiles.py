@@ -131,3 +131,72 @@ class TestProfileScopedHubActions:
             json={"identifier": "official/demo", "profile": "ghost"},
         )
         assert resp.status_code == 404
+
+
+class TestSkillReadinessInListing:
+    """GET /api/skills reports per-skill readiness from frontmatter + the
+    REQUESTED profile's .env — names and is_set only, never values."""
+
+    _FRONTMATTER = (
+        "---\nname: needs-setup\ndescription: needs things\n"
+        "required_environment_variables:\n"
+        "  - name: DEMO_API_KEY\n    prompt: Your Demo API key\n    help: https://demo.example/keys\n"
+        "  - name: DEMO_OPTIONAL\n    optional: true\n"
+        "prerequisites:\n  commands: [definitely-not-a-real-binary-xyz]\n"
+        "required_credential_files:\n  - demo/token.json\n"
+        "---\n\n# needs-setup\n")
+
+    def _write(self, home):
+        d = home / "skills" / "needs-setup"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(self._FRONTMATTER, encoding="utf-8")
+
+    def _get(self, client, name, **params):
+        resp = client.get("/api/skills", params=params)
+        assert resp.status_code == 200
+        return next(s for s in resp.json() if s["name"] == name)
+
+    def test_missing_requirements_reported(self, client, isolated_profiles, monkeypatch):
+        monkeypatch.delenv("DEMO_API_KEY", raising=False)
+        self._write(isolated_profiles["worker_alpha"])
+        skill = self._get(client, "needs-setup", profile="worker_alpha")
+        assert skill["setup_needed"] is True
+        assert skill["missing_env"] == ["DEMO_API_KEY"]
+        assert skill["missing_commands"] == ["definitely-not-a-real-binary-xyz"]
+        assert skill["missing_credential_files"] == ["demo/token.json"]
+        keys = {e["key"]: e for e in skill["required_env"]}
+        assert keys["DEMO_API_KEY"] == {
+            "key": "DEMO_API_KEY", "is_set": False, "optional": False,
+            "url": "https://demo.example/keys", "description": "Your Demo API key"}
+        assert keys["DEMO_OPTIONAL"]["optional"] is True
+        assert "_requirements" not in skill
+
+    def test_readiness_uses_target_profile_env_and_hides_values(
+            self, client, isolated_profiles, monkeypatch):
+        monkeypatch.delenv("DEMO_API_KEY", raising=False)
+        worker = isolated_profiles["worker_alpha"]
+        self._write(worker)
+        (worker / ".env").write_text("DEMO_API_KEY=sekrit-value-123\n", encoding="utf-8")
+        (worker / "demo").mkdir()
+        (worker / "demo" / "token.json").write_text("{}", encoding="utf-8")
+
+        resp = client.get("/api/skills", params={"profile": "worker_alpha"})
+        assert "sekrit-value-123" not in resp.text
+        skill = next(s for s in resp.json() if s["name"] == "needs-setup")
+        assert skill["setup_needed"] is False
+        assert skill["missing_env"] == []
+        assert skill["missing_credential_files"] == []
+        assert next(e for e in skill["required_env"] if e["key"] == "DEMO_API_KEY")["is_set"] is True
+        # Missing commands are advisory — they don't flip setup_needed.
+        assert skill["missing_commands"] == ["definitely-not-a-real-binary-xyz"]
+
+        # The dashboard's own profile doesn't see the worker's .env.
+        self._write(isolated_profiles["default"])
+        own = self._get(client, "needs-setup")
+        assert own["missing_env"] == ["DEMO_API_KEY"]
+
+    def test_plain_skill_is_ready(self, client, isolated_profiles):
+        skill = self._get(client, "worker-skill", profile="worker_alpha")
+        assert skill["setup_needed"] is False
+        assert skill["missing_env"] == skill["missing_commands"] == []
+        assert skill["missing_credential_files"] == skill["required_env"] == []
