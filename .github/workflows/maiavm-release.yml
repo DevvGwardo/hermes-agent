@@ -1,0 +1,40 @@
+name: maiavm release tag
+
+# Fork-only (see FORK.md): tag the current `maiavm` head as maiavm-YYYY.MM.DD
+# for hermes-deploy to pin. Names never match the upstream `v*.*.*` release
+# triggers, so no inherited publish/installer workflow fires.
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'One line describing this release (stored in the tag message)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.repository == 'DevvGwardo/hermes-agent' && github.ref == 'refs/heads/maiavm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: maiavm
+          fetch-depth: 0
+
+      - name: Create tag
+        env:
+          NOTE: ${{ inputs.note }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          base="maiavm-$(date -u +%Y.%m.%d)"
+          tag="$base"; n=2
+          while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do tag="$base-$n"; n=$((n + 1)); done
+          git tag -a "$tag" -m "${NOTE:-maiavm release} ($(git rev-parse --short HEAD))"
+          git push origin "refs/tags/$tag"
+          echo "Tagged $tag at $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
