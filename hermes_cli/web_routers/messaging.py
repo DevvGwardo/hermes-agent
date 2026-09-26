@@ -170,6 +170,13 @@ def _validate_messaging_env_value(platform_id: str, key: str, value: str) -> Non
         raise HTTPException(status_code=400, detail=rule[1])
 
 
+# Access/delivery settings that are identifiers, not credentials: rows carry the plain ``value``
+# so clients can show/edit them without the POST /api/env/reveal round trip.
+_PLAIN_VALUE_KEY_RE = re.compile(
+    r"^[A-Z0-9_]+_(?:ALLOWED_USERS|ALLOW_ALL_USERS|HOME_ROOM|HOME_CHANNEL(?:_[A-Z0-9_]+)?)$"
+    r"|^EMAIL_(?:HOME_ADDRESS|IMAP_PORT|SMTP_PORT)$")
+
+
 def _messaging_env_info(key: str) -> dict[str, Any]:
     info = OPTIONAL_ENV_VARS.get(key) or _MESSAGING_ENV_FALLBACKS.get(key) or {}
     return {
@@ -255,14 +262,17 @@ def _messaging_platform_payload(
         # os.environ carries the ROOT install's .env and would report root credentials as the profile's.
         return env_on_disk.get(key) or ("" if scoped else os.getenv(key, ""))
 
+    def env_row(key: str, value: str) -> dict[str, Any]:
+        row = {
+            "key": key, "required": key in entry["required_env"], "is_set": bool(value),
+            "redacted_value": redact_key(value) if value else None, **_messaging_env_info(key),
+        }
+        if not row["is_password"] and _PLAIN_VALUE_KEY_RE.match(key):
+            row["value"] = value
+        return row
+
     def env_rows(keys) -> list[dict[str, Any]]:
-        return [
-            {
-                "key": key, "required": key in entry["required_env"], "is_set": bool(value),
-                "redacted_value": redact_key(value) if value else None, **_messaging_env_info(key),
-            }
-            for key, value in ((key, env_value(key)) for key in keys)
-        ]
+        return [env_row(key, env_value(key)) for key in keys]
 
     env_vars = env_rows(entry["env_vars"])
 

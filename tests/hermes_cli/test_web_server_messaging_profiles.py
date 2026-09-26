@@ -372,3 +372,23 @@ class TestAccessAndHomeEnvVars:
             json={"env": {"DISCORD_HOME_CHANNEL": "1"}, "profile": "worker_alpha"},
         )
         assert resp.status_code == 400
+
+    def test_access_and_home_values_are_plain_but_credentials_stay_redacted(self, client, isolated_profiles):
+        (isolated_profiles["worker_alpha"] / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_1234\n"
+            "TELEGRAM_ALLOWED_USERS=111,222\nTELEGRAM_HOME_CHANNEL=-100123\n"
+            "EMAIL_PASSWORD=hunter2-app-password\nEMAIL_IMAP_PORT=993\nEMAIL_HOME_ADDRESS=me@example.com\n",
+            encoding="utf-8")
+        platforms = {p["id"]: p for p in client.get(
+            "/api/messaging/platforms", params={"profile": "worker_alpha"}).json()["platforms"]}
+        rows = {f["key"]: f for pid in ("telegram", "email")
+                for f in platforms[pid]["env_vars"] + platforms[pid]["extra_env_vars"]}
+        assert rows["TELEGRAM_ALLOWED_USERS"]["value"] == "111,222"
+        assert rows["TELEGRAM_HOME_CHANNEL"]["value"] == "-100123"
+        assert rows["EMAIL_IMAP_PORT"]["value"] == "993"
+        assert rows["EMAIL_HOME_ADDRESS"]["value"] == "me@example.com"
+        assert rows["TELEGRAM_ALLOW_ALL_USERS"]["value"] == ""  # unset, still plain
+        for secret_key in ("TELEGRAM_BOT_TOKEN", "EMAIL_PASSWORD"):
+            assert "value" not in rows[secret_key]
+        payload = str(platforms["telegram"]) + str(platforms["email"])
+        assert "hunter2-app-password" not in payload and "ABCDEFGHIJKLMNOPQRSTUVWXYZ_1234" not in payload
