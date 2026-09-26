@@ -251,6 +251,85 @@ class TestMemoryEndpoints:
         ).status_code == 400
 
 
+class TestMemoryPendingEndpoints:
+    """REST face of /memory pending|approve|reject (memory.write_approval)."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, _isolate_hermes_home):
+        self.client, _ = _client()
+
+    @staticmethod
+    def _stage(content, target="memory"):
+        from tools import write_approval as wa
+        return wa.stage_write(
+            wa.MEMORY, {"action": "add", "target": target, "content": content, "old_text": None},
+            summary=f"add to {target}", origin="foreground")["id"]
+
+    def test_list_shape(self):
+        assert self.client.get("/api/memory/pending").json() == {"pending": []}
+        pid = self._stage("prefers dark mode", target="user")
+        pending = self.client.get("/api/memory/pending").json()["pending"]
+        assert [p["id"] for p in pending] == [pid]
+        item = pending[0]
+        assert item["target"] == "user" and item["content"] == "prefers dark mode"
+        assert isinstance(item["created_at"], (int, float))
+
+    def test_approve_applies_and_clears(self):
+        from hermes_constants import get_hermes_home
+        from tools import write_approval as wa
+
+        pid = self._stage("the deploy host is vm-7")
+        r = self.client.post(f"/api/memory/pending/{pid}/approve")
+        assert r.status_code == 200 and r.json() == {"ok": True}
+        assert wa.get_pending(wa.MEMORY, pid) is None
+        text = (get_hermes_home() / "memories" / "MEMORY.md").read_text(encoding="utf-8")
+        assert "the deploy host is vm-7" in text
+
+    def test_reject_discards_without_writing(self):
+        from hermes_constants import get_hermes_home
+        from tools import write_approval as wa
+
+        pid = self._stage("do not keep this")
+        r = self.client.post(f"/api/memory/pending/{pid}/reject")
+        assert r.status_code == 200 and r.json() == {"ok": True}
+        assert wa.get_pending(wa.MEMORY, pid) is None
+        mem = get_hermes_home() / "memories" / "MEMORY.md"
+        assert not mem.exists() or "do not keep this" not in mem.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("verb", ["approve", "reject"])
+    def test_unknown_id_404(self, verb):
+        assert self.client.post(f"/api/memory/pending/nope1234/{verb}").status_code == 404
+        assert self.client.post(f"/api/memory/pending/..%2E/{verb}").status_code == 404
+
+    def test_profile_scoped(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        from hermes_cli import profiles
+        from tools import write_approval as wa
+
+        default_home = get_hermes_home()
+        profiles_root = default_home / "profiles"
+        worker = profiles_root / "worker_beta"
+        worker.mkdir(parents=True)
+        (worker / "config.yaml").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
+        monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+
+        own = self._stage("dashboard profile item")
+        # Stage into the worker profile's pending store.
+        monkeypatch.setenv("HERMES_HOME", str(worker))
+        theirs = self._stage("worker profile item")
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        listed = self.client.get("/api/memory/pending", params={"profile": "worker_beta"}).json()
+        assert [p["id"] for p in listed["pending"]] == [theirs]
+        assert self.client.post(
+            f"/api/memory/pending/{own}/approve", params={"profile": "worker_beta"}).status_code == 404
+        r = self.client.post(f"/api/memory/pending/{theirs}/approve", params={"profile": "worker_beta"})
+        assert r.status_code == 200
+        assert "worker profile item" in (worker / "memories" / "MEMORY.md").read_text(encoding="utf-8")
+        assert wa.get_pending(wa.MEMORY, own) is not None  # dashboard's own untouched
+
+
 class TestPairingEndpoints:
     @pytest.fixture(autouse=True)
     def _setup(self, _isolate_hermes_home):

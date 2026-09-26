@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from tools import write_approval as wa
 
@@ -76,9 +76,8 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, failed = 0, []
     for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
+        ok, msg = approve_record(subsystem, rec, memory_store)
         if ok:
-            wa.discard_pending(subsystem, rec["id"])
             applied += 1
         else:
             failed.append(f"{rec['id']}: {msg}")
@@ -88,6 +87,15 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         out.append("Failed:")
         out.extend(f"  {f}" for f in failed)
     return "\n".join(out)
+
+
+def approve_record(subsystem: str, rec, memory_store) -> Tuple[bool, str]:
+    """Apply one pending record and drop it on success; on failure it stays pending.
+    Shared by the slash commands and the dashboard REST routes."""
+    ok, msg = _apply_one(subsystem, rec, memory_store)
+    if ok:
+        wa.discard_pending(subsystem, rec["id"])
+    return ok, msg
 
 
 def _apply_one(subsystem: str, rec, memory_store):
