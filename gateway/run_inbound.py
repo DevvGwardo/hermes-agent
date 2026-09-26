@@ -35,6 +35,23 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+class _KeepUnknownPlaceholders(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def _custom_pairing_instructions(template: Any, platform_name: str, code: str) -> Optional[str]:
+    """``gateway.pairing_instructions`` with {platform}/{code} filled in, or None (use the default
+    CLI instruction) when unset or malformed. Unknown placeholders are left verbatim."""
+    if not isinstance(template, str) or not template.strip():
+        return None
+    try:
+        return template.strip().format_map(_KeepUnknownPlaceholders(platform=platform_name, code=code))
+    except (ValueError, IndexError, AttributeError, KeyError):
+        logger.warning("gateway.pairing_instructions is not a valid template; using the default text")
+        return None
+
+
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -94,12 +111,18 @@ class GatewayInboundMixin:
                 if isinstance(store_profile, str) and store_profile and store_profile != "default"
                 else ""
             )
-            reply = (
-                f"Hi~ I don't recognize you yet!\n\n"
-                f"Here's your pairing code: `{code}`\n\n"
+            instructions = _custom_pairing_instructions(
+                getattr(getattr(self, "config", None), "pairing_instructions", None),
+                platform_name, code,
+            ) or (
                 f"Ask the bot owner to run:\n"
                 f"`hermes {profile_arg}pairing approve "
                 f"{platform_name} {code}`"
+            )
+            reply = (
+                f"Hi~ I don't recognize you yet!\n\n"
+                f"Here's your pairing code: `{code}`\n\n"
+                f"{instructions}"
             )
         else:
             reply = "Too many pairing requests right now~ Please try again later!"

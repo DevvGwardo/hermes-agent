@@ -1885,6 +1885,11 @@ DEFAULT_CONFIG = {
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         # Named-profile allowlist for multiplex mode. None = serve all; [] = default only.
         "multiplex_profile_allowlist": None,
+        # What an unrecognized DM sender is told to do with their pairing code. Blank = the
+        # default "Ask the bot owner to run: `hermes pairing approve <platform> <code>`". Set it
+        # when owners approve elsewhere (a hosted app, a web dashboard); {platform} and {code}
+        # are filled in, e.g. "Send code {code} to the owner so they can approve you in the app."
+        "pairing_instructions": "",
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,

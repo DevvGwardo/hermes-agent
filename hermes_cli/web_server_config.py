@@ -145,6 +145,14 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "not writable."
         ),
     },
+    "gateway.pairing_instructions": {
+        "type": "string",
+        "description": (
+            "Message shown to an unrecognized person who DMs the bot, telling them how to get "
+            "approved. Use {platform} and {code} as placeholders. Leave blank to show the "
+            "default 'ask the owner to run hermes pairing approve' instruction."
+        ),
+    },
     "browser.headed": {
         "type": "boolean",
         "description": "Run the local browser in headed mode (visible window). Also keeps the window open between turns; idle sessions are still reaped after browser.inactivity_timeout.",

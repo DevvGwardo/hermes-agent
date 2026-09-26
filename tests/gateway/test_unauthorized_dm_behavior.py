@@ -239,6 +239,56 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
     assert "ABC12DEF" in adapter.send.await_args.args[1]
 
 
+async def _pairing_reply(monkeypatch, config: GatewayConfig) -> str:
+    _clear_auth_env(monkeypatch)
+    runner, adapter = _make_runner(Platform.TELEGRAM, config)
+    runner.pairing_store.generate_code.return_value = "ABC12DEF"
+    await runner._handle_message(_make_event(Platform.TELEGRAM, "4242", "4242"))
+    adapter.send.assert_awaited_once()
+    return adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_pairing_reply_defaults_to_cli_instruction(monkeypatch):
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)})
+    reply = await _pairing_reply(monkeypatch, config)
+    assert "ABC12DEF" in reply
+    assert "pairing approve telegram ABC12DEF" in reply
+
+
+@pytest.mark.asyncio
+async def test_pairing_reply_uses_configured_instructions(monkeypatch):
+    config = GatewayConfig.from_dict({
+        "platforms": {"telegram": {"enabled": True}},
+        "pairing_instructions": "Send {code} to your host so they can approve you on {platform}. {unknown}",
+    })
+    reply = await _pairing_reply(monkeypatch, config)
+    assert "Send ABC12DEF to your host so they can approve you on telegram. {unknown}" in reply
+    assert "pairing approve" not in reply
+    assert "`ABC12DEF`" in reply  # the code line itself is kept
+
+
+@pytest.mark.asyncio
+async def test_pairing_reply_malformed_template_falls_back(monkeypatch):
+    config = GatewayConfig.from_dict({
+        "platforms": {"telegram": {"enabled": True}},
+        "pairing_instructions": "broken {code",
+    })
+    reply = await _pairing_reply(monkeypatch, config)
+    assert "pairing approve telegram ABC12DEF" in reply
+
+
+def test_pairing_instructions_bridged_from_gateway_section():
+    """config.yaml ``gateway.pairing_instructions`` reaches GatewayConfig."""
+    from gateway.config_loader import bridge_toplevel_keys
+
+    gw_data: dict = {}
+    bridge_toplevel_keys({}, {"pairing_instructions": "Approve {code} in the app"}, gw_data)
+    assert GatewayConfig.from_dict(gw_data).pairing_instructions == "Approve {code} in the app"
+    assert GatewayConfig.from_dict({"pairing_instructions": "  "}).pairing_instructions is None
+    assert GatewayConfig.from_dict({}).pairing_instructions is None
+
+
 @pytest.mark.asyncio
 async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
     _clear_auth_env(monkeypatch)
