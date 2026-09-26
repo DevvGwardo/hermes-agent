@@ -458,6 +458,9 @@ class SkillContentUpdate(BaseModel):
 class ToolsetToggle(BaseModel):
     enabled: bool
     profile: Optional[str] = None
+    # Messaging platform whose platform_toolsets entry to write (e.g. "telegram");
+    # omitted → the toolset's configuration platform (cli for most).
+    platform: Optional[str] = None
 
 class ToolsetProviderSelect(BaseModel):
     provider: str

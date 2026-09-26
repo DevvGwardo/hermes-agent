@@ -264,13 +264,25 @@ async def get_toolsets(profile: Optional[str] = None):
 async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] = None):
     """Enable/disable a configurable toolset for its configuration platform
     (``platform_toolsets.cli`` for most; platform-restricted toolsets target
-    their own platform) via the same ``_save_platform_tools`` the CLI uses."""
+    their own platform) via the same ``_save_platform_tools`` the CLI uses.
+    ``body.platform`` (e.g. ``telegram``) targets that platform's entry instead."""
     from hermes_cli.tools_config import (
-        _CONFIG_ONLY_TOOLSETS, _get_platform_tools, _save_platform_tools,
-        _toolset_configuration_platform)
+        _CONFIG_ONLY_TOOLSETS, PLATFORMS, _get_platform_tools, _save_platform_tools,
+        _toolset_allowed_for_platform, _toolset_configuration_platform)
 
     _require_known_toolset(name)
-    target_platform = _toolset_configuration_platform(name)
+    if body.platform is not None:
+        target_platform = body.platform.strip().lower()
+        if target_platform not in PLATFORMS:
+            raise HTTPException(status_code=400, detail=f"Unknown platform: {body.platform}")
+        if name in _CONFIG_ONLY_TOOLSETS:
+            raise HTTPException(
+                status_code=400, detail=f"Toolset '{name}' is global and has no per-platform setting")
+        if not _toolset_allowed_for_platform(name, target_platform):
+            raise HTTPException(
+                status_code=400, detail=f"Toolset '{name}' is not available on platform '{target_platform}'")
+    else:
+        target_platform = _toolset_configuration_platform(name)
     scope_profile = body.profile or profile
 
     def _run():
