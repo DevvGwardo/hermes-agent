@@ -1,0 +1,95 @@
+name: maiavm upstream sync
+
+# Fork-only (see FORK.md): mirror NousResearch/hermes-agent main into the
+# `upstream` branch and propose it to `maiavm` as a reviewed PR. Never pushes
+# to maiavm itself and never contacts the upstream repo beyond a read-only fetch.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: maiavm-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'DevvGwardo/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # A PAT with Workflows permission is needed to push upstream commits that
+      # touch .github/workflows, and so the sync PR triggers CI (FORK.md).
+      GH_TOKEN: ${{ secrets.MAIAVM_SYNC_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: maiavm
+          fetch-depth: 0
+          token: ${{ secrets.MAIAVM_SYNC_TOKEN || github.token }}
+
+      - name: Fetch upstream (read-only)
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream main
+
+      - name: Mirror upstream main to the upstream branch
+        run: git push --force origin refs/remotes/upstream/main:refs/heads/upstream
+
+      - name: Merge upstream into a sync branch
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
+            echo "state=uptodate" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          branch="sync/upstream-$(date -u +%Y%m%d)"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "behind=$(git rev-list --count HEAD..refs/remotes/upstream/main)" >> "$GITHUB_OUTPUT"
+          git switch -c "$branch"
+          if git merge --no-ff --no-edit -m "Merge upstream/main into maiavm ($(date -u +%Y-%m-%d))" refs/remotes/upstream/main; then
+            echo "state=clean" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "state=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open the sync PR
+        if: steps.merge.outputs.state == 'clean'
+        env:
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          BEHIND: ${{ steps.merge.outputs.behind }}
+        run: |
+          git push --force origin "$BRANCH"
+          if [ -n "$(gh pr list --repo "$GITHUB_REPOSITORY" --base maiavm --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "PR already open for $BRANCH"
+            exit 0
+          fi
+          gh pr create --repo "$GITHUB_REPOSITORY" --base maiavm --head "$BRANCH" \
+            --title "sync: merge upstream main into maiavm ($(date -u +%Y-%m-%d))" \
+            --body "Automated upstream sync (see FORK.md). Brings in ${BEHIND} upstream commits; merged cleanly.
+
+          Review before merging — upstream behaviour changes reach production through this PR. After merging, cut a tag with **maiavm release tag** and canary it before bumping the hermes-deploy pin."
+
+      - name: Report conflicts
+        if: steps.merge.outputs.state == 'conflict'
+        env:
+          BEHIND: ${{ steps.merge.outputs.behind }}
+        run: |
+          title="Upstream sync needs conflict resolution"
+          body="$(printf 'The daily upstream sync could not merge %s upstream commits into \x60maiavm\x60 cleanly.\n\nConflicting files:\n\n' "$BEHIND"; sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"; printf '\n\nResolve on a \x60sync/upstream-*\x60 branch from \x60maiavm\x60 (\x60git merge upstream/main\x60) and open a PR into \x60maiavm\x60. See FORK.md.\n')"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
