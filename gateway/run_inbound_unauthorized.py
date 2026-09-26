@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from typing import Any, Optional
 
 from gateway.pairing import CODE_TTL_SECONDS, _allowlist_env_for_platform
 
@@ -36,18 +37,41 @@ def pairing_profile_arg(pairing_store) -> str:
     return ""
 
 
-def pairing_code_reply(platform_name: str, code: str, profile_arg: str = "") -> str:
+class _KeepUnknownPlaceholders(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def custom_pairing_instructions(template: Any, platform_name: str, code: str) -> Optional[str]:
+    """``gateway.pairing_instructions`` with {platform}/{code} filled in, or None (use the default
+    CLI instruction) when unset or malformed. Unknown placeholders are left verbatim."""
+    if not isinstance(template, str) or not template.strip():
+        return None
+    try:
+        return template.strip().format_map(_KeepUnknownPlaceholders(platform=platform_name, code=code))
+    except (ValueError, IndexError, AttributeError, KeyError):
+        logger.warning("gateway.pairing_instructions is not a valid template; using the default text")
+        return None
+
+
+def pairing_code_reply(platform_name: str, code: str, profile_arg: str = "",
+                       instructions: Any = None) -> str:
     """The DM a first-time sender receives: what happened, how long the code lives, what to do
-    whether they are the owner or a guest, and that they must message again after approval."""
+    whether they are the owner or a guest, and that they must message again after approval.
+    ``instructions`` (the ``gateway.pairing_instructions`` template) replaces the CLI approval
+    sentence when set, for owners who approve elsewhere (a hosted app, a web dashboard)."""
     hours = max(1, CODE_TTL_SECONDS // 3600)
     validity = f"{hours} hour" if hours == 1 else f"{hours} hours"
     approve_cmd = f"hermes {profile_arg}pairing approve {platform_name} {code}"
+    custom = custom_pairing_instructions(instructions, platform_name, code)
+    how = f"{custom}\n\n" if custom else (
+        f"If you run this bot, open a terminal and run: `{approve_cmd}`. "
+        "Otherwise send that command to the bot owner. ")
     return (
         "Hi! I don't recognize you yet, so I can't reply until the person running this bot "
         "approves you.\n\n"
         f"Your pairing code: `{code}` (valid for {validity})\n\n"
-        f"If you run this bot, open a terminal and run: `{approve_cmd}`. "
-        "Otherwise send that command to the bot owner. After approval, send your message again."
+        f"{how}After approval, send your message again."
     )
 
 

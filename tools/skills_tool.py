@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from contextlib import suppress
+from contextvars import ContextVar, Token
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -102,6 +103,20 @@ def set_secret_capture_callback(callback) -> None:
     _secret_capture_callback = callback
 
 
+# Per-run override for hosts that serve many concurrent runs from one process (API server
+# /v1/runs): the process-global callback above cannot tell runs apart. Wins over the
+# global callback and over the gateway "no secure entry" hint when bound.
+_scoped_secret_capture_callback: ContextVar = ContextVar("scoped_secret_capture_callback", default=None)
+
+
+def bind_scoped_secret_capture_callback(callback) -> Token:
+    return _scoped_secret_capture_callback.set(callback)
+
+
+def reset_scoped_secret_capture_callback(token: Token) -> None:
+    _scoped_secret_capture_callback.reset(token)
+
+
 def _skill_utils_delegate(attr: str):
     """Lazy call-time delegate to ``agent.skill_utils.<attr>`` (re-export; patches honored)."""
     def _delegate(*args):
@@ -181,9 +196,69 @@ def _skill_search_dirs() -> Tuple[list, list, Path]:
     return project_dirs, all_dirs, active_skills_dir
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+# Frontmatter keys skill_setup_status() reads; _find_all_skills keeps just these per skill.
+_REQUIREMENT_FRONTMATTER_KEYS = (
+    "required_environment_variables", "setup", "prerequisites", "required_credential_files")
+
+
+def _skill_copies(skills: List[Dict[str, Any]], with_requirements: bool) -> List[Dict[str, Any]]:
+    """Shallow copies for callers (they mutate them); the private requirements slice only
+    when asked, so tool output (skills_list) keeps its shape."""
+    copies = [dict(s) for s in skills]
+    if not with_requirements:
+        for s in copies:
+            s.pop("_requirements", None)
+    return copies
+
+
+def skill_setup_status(frontmatter: Dict[str, Any], env_snapshot: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Read-only readiness summary for listings (dashboard ``GET /api/skills``).
+
+    Same inputs as ``_skill_readiness`` (env vars via ``_get_required_environment_variables``,
+    ``required_credential_files``) plus ``prerequisites.commands`` checked on PATH — but never
+    prompts, registers passthroughs or mounts, and never returns values. ``setup_needed``
+    mirrors skill_view's readiness (missing required env / credential files); missing commands
+    are advisory (host PATH only — a remote terminal backend may still provide them)."""
+    import shutil
+    env_snapshot = load_env() if env_snapshot is None else env_snapshot
+    required_env = []
+    for e in _get_required_environment_variables(frontmatter):
+        entry: Dict[str, Any] = {"key": e["name"], "is_set": _is_env_var_persisted(e["name"], env_snapshot),
+                                 "optional": bool(e.get("optional"))}
+        help_text = e.get("help") or ""
+        if help_text.startswith(("http://", "https://")):
+            entry["url"] = help_text
+        default_prompt = f"Enter value for {e['name']}"
+        if e.get("prompt") and e["prompt"] != default_prompt:
+            entry["description"] = e["prompt"]
+        elif help_text and "url" not in entry:
+            entry["description"] = help_text
+        required_env.append(entry)
+    missing_env = [e["key"] for e in required_env if not e["optional"] and not e["is_set"]]
+    prereqs = frontmatter.get("prerequisites")
+    commands = prereqs.get("commands") if isinstance(prereqs, dict) else None
+    commands = [commands] if isinstance(commands, str) else commands if isinstance(commands, list) else []
+    missing_commands = [str(c).strip() for c in commands
+                        if str(c).strip() and shutil.which(str(c).strip()) is None]
+    missing_cred_files: List[str] = []
+    cred_raw = frontmatter.get("required_credential_files", [])
+    if isinstance(cred_raw, list) and cred_raw:
+        try:
+            from tools.credential_files import missing_credential_files
+            missing_cred_files = missing_credential_files(cred_raw)
+        except Exception:
+            logger.debug("Could not check credential files", exc_info=True)
+    return {
+        "setup_needed": bool(missing_env or missing_cred_files),
+        "missing_env": missing_env, "missing_commands": missing_commands,
+        "missing_credential_files": missing_cred_files, "required_env": required_env}
+
+
+def _find_all_skills(*, skip_disabled: bool = False, with_requirements: bool = False) -> List[Dict[str, Any]]:
     """All skills (name, description, category) across project/local/external dirs, first-wins
-    by name; cached per session. ``skip_disabled=True`` ignores disabled state (config UI)."""
+    by name; cached per session. ``skip_disabled=True`` ignores disabled state (config UI).
+    ``with_requirements=True`` adds ``_requirements`` (the frontmatter slice
+    ``skill_setup_status`` reads) to each entry."""
     from agent.skill_utils import iter_project_skill_files, iter_skill_index_files
     cache_key = "with_disabled" if skip_disabled else "filtered"
     disabled = set() if skip_disabled else _get_disabled_skill_names()
@@ -194,7 +269,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     if cached is not None and cached[0] == signature and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS:
         # Shallow copies: callers mutate the returned dicts (web_server annotates
         # s["enabled"]/s["usage"]); handing out cached objects would poison the cache.
-        return [dict(s) for s in cached[2]]
+        return _skill_copies(cached[2], with_requirements)
     skills = []
     seen_names: set = set()
     for scan_dir in dirs_to_scan:  # project dirs go through the quarantine chokepoint
@@ -215,7 +290,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                                         if ln and not ln.startswith("#")), description)
                 seen_names.add(name)
                 skills.append({"name": name, "description": _truncate_description(description),
-                               "category": _get_category_from_path(skill_md)})
+                               "category": _get_category_from_path(skill_md),
+                               "_requirements": {k: frontmatter[k] for k in _REQUIREMENT_FRONTMATTER_KEYS
+                                                 if k in frontmatter}})
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
             except Exception as e:
@@ -223,7 +300,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Keyed by the signature computed BEFORE the scan: a write racing the scan changes the
     # signature, so the next call re-scans instead of serving a torn result.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
-    return [dict(s) for s in skills]
+    return _skill_copies(skills, with_requirements)
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

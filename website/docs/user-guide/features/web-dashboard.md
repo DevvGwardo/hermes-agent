@@ -588,11 +588,12 @@ same auth gate as the rest of `/api/`.
 | `DELETE /api/mcp/servers/{name}` | Remove a server |
 | `GET /api/mcp/catalog` | Browse the Nous-approved MCP catalog |
 | `POST /api/mcp/catalog/install` | Install a catalog entry (with required env) |
-| `GET /api/messaging/platforms` | List every messaging channel with status + per-platform setup fields |
+| `GET /api/messaging/platforms` | List every messaging channel with status + per-platform setup fields (credentials redacted; allowlist, allow-all, home-channel/room/address and email port rows also carry their plain `value`) |
 | `PUT /api/messaging/platforms/{id}` | Configure a channel. Body: `{enabled?, env?, clear_env?}` (env writes to `.env`, enabled to `config.yaml`) |
 | `POST /api/messaging/platforms/{id}/test` | Report whether a channel is configured, enabled, and connected |
 | `GET /api/pairing` | List pending + approved messaging users |
 | `POST /api/pairing/approve` | Approve a code. Body: `{platform, code}` |
+| `POST /api/pairing/deny` | Reject one pending request without approving it. Body: `{platform, request_id, profile?}` (404 when unknown/expired) |
 | `POST /api/pairing/revoke` | Revoke a user. Body: `{platform, user_id}` |
 | `POST /api/pairing/clear-pending` | Drop all pending codes |
 | `GET /api/webhooks` | List subscriptions + platform-enabled status |

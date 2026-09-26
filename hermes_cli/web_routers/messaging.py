@@ -62,6 +62,21 @@ _probe_gateway_health = late("_probe_gateway_health", "hermes_cli.web_server_gat
 get_running_pid_cached = late("get_running_pid_cached", "gateway.status")
 get_runtime_status_running_pid = late("get_runtime_status_running_pid", "gateway.status")
 _GATEWAY_HEALTH_URL = LateState("_GATEWAY_HEALTH_URL")
+def _allowed_users_row(key: str, label: str) -> tuple:
+    return (key, f"{label} users allowed to talk to the bot, separated by commas. Leave blank to approve "
+                 "new people by pairing code instead.", f"Allowed {label} users", {})
+
+
+def _allow_all_row(key: str, who: str) -> tuple:
+    return (key, f"Let any {who} talk to the bot without approval (true/false). Leave off unless the "
+                 "bot is private.", "Allow everyone? (true/false)", {"advanced": True})
+
+
+def _home_channel_row(key: str, label: str) -> tuple:
+    return (key, f"{label} chat that receives scheduled results and notifications. Sending /sethome "
+                 "in a chat sets this for you.", "Home chat ID", {"advanced": True})
+
+
 # Display labels for env vars not in OPTIONAL_ENV_VARS (bridge toggles, Twilio, HASS, Email, ...)
 # so the UI can still render a friendly label. Rows: (key, description, prompt, extra flags).
 _MESSAGING_ENV_FALLBACKS: dict[str, dict[str, Any]] = {
@@ -98,6 +113,26 @@ _MESSAGING_ENV_FALLBACKS: dict[str, dict[str, Any]] = {
         ("FEISHU_VERIFICATION_TOKEN", "Feishu / Lark verification token", "Verification token", {"password": True}),
         ("DINGTALK_CLIENT_ID", "DingTalk client ID (App key)", "Client ID", {}),
         ("DINGTALK_CLIENT_SECRET", "DingTalk client secret (App secret)", "Client secret", {"password": True}),
+        # Email extras (the email plugin normally registers these; kept here so the card never
+        # shows a raw key if it didn't load).
+        ("EMAIL_IMAP_PORT", "IMAP server port. Leave blank to use the standard secure port, 993.", "IMAP port", {"advanced": True}),
+        ("EMAIL_SMTP_PORT", "SMTP server port. Leave blank to use the standard port, 587.", "SMTP port", {"advanced": True}),
+        ("EMAIL_ALLOWED_USERS", "Email addresses allowed to talk to the bot, separated by commas", "Allowed email addresses", {}),
+        ("EMAIL_HOME_ADDRESS", "Email address that receives scheduled results and notifications", "Home address", {"advanced": True}),
+        ("MATRIX_HOME_ROOM", "Matrix room ID that receives scheduled results and notifications (for example !abc123:matrix.org). Sending /sethome in a room sets this for you.", "Home room", {"advanced": True}),
+        *(_allowed_users_row(key, label) for key, label in (
+            ("WECOM_CALLBACK_ALLOWED_USERS", "WeCom"), ("WEIXIN_ALLOWED_USERS", "WeChat"),
+            ("YUANBAO_ALLOWED_USERS", "Yuanbao"), ("A2A_ALLOWED_USERS", "A2A"),
+            ("WHATSAPP_CLOUD_ALLOWED_USERS", "WhatsApp"))),
+        *(_allow_all_row(key, label) for key, label in (
+            ("EMAIL_ALLOW_ALL_USERS", "email sender"), ("SIGNAL_ALLOW_ALL_USERS", "Signal user"),
+            ("SMS_ALLOW_ALL_USERS", "phone number"), ("DINGTALK_ALLOW_ALL_USERS", "DingTalk user"),
+            ("GOOGLE_CHAT_ALLOW_ALL_USERS", "Google Chat user"), ("WECOM_ALLOW_ALL_USERS", "WeCom user"),
+            ("WECOM_CALLBACK_ALLOW_ALL_USERS", "WeCom user"), ("WEIXIN_ALLOW_ALL_USERS", "WeChat user"),
+            ("YUANBAO_ALLOW_ALL_USERS", "Yuanbao user"), ("WHATSAPP_CLOUD_ALLOW_ALL_USERS", "WhatsApp user"))),
+        *(_home_channel_row(key, label) for key, label in (
+            ("SIGNAL_HOME_CHANNEL", "Signal"), ("BLUEBUBBLES_HOME_CHANNEL", "iMessage"),
+            ("WEIXIN_HOME_CHANNEL", "WeChat"), ("WHATSAPP_CLOUD_HOME_CHANNEL", "WhatsApp"))),
     )
 }
 
@@ -139,6 +174,13 @@ def _validate_messaging_env_value(platform_id: str, key: str, value: str) -> Non
     rule = _ENV_VALUE_RULES.get((platform_id, key))
     if value and rule and not rule[0](value):
         raise HTTPException(status_code=400, detail=rule[1])
+
+
+# Access/delivery settings that are identifiers, not credentials: rows carry the plain ``value``
+# so clients can show/edit them without the POST /api/env/reveal round trip.
+_PLAIN_VALUE_KEY_RE = re.compile(
+    r"^[A-Z0-9_]+_(?:ALLOWED_USERS|ALLOW_ALL_USERS|HOME_ROOM|HOME_CHANNEL(?:_[A-Z0-9_]+)?)$"
+    r"|^EMAIL_(?:HOME_ADDRESS|IMAP_PORT|SMTP_PORT)$")
 
 
 def _messaging_env_info(key: str) -> dict[str, Any]:
@@ -232,13 +274,19 @@ def _messaging_platform_payload(
         # os.environ carries the ROOT install's .env and would report root credentials as the profile's.
         return env_on_disk.get(key) or ("" if scoped else os.getenv(key, ""))
 
-    env_vars = [
-        {
+    def env_row(key: str, value: str) -> dict[str, Any]:
+        row = {
             "key": key, "required": key in entry["required_env"], "is_set": bool(value),
             "redacted_value": redacted_credential_preview(value), **_messaging_env_info(key),
         }
-        for key, value in ((key, env_value(key)) for key in entry["env_vars"])
-    ]
+        if not row["is_password"] and _PLAIN_VALUE_KEY_RE.match(key):
+            row["value"] = value
+        return row
+
+    def env_rows(keys) -> list[dict[str, Any]]:
+        return [env_row(key, env_value(key)) for key in keys]
+
+    env_vars = env_rows(entry["env_vars"])
 
     enabled, configured, home_channel = _platform_enablement(platform_id, entry, env_on_disk, scoped)
 
@@ -268,6 +316,8 @@ def _messaging_platform_payload(
         "home_channel": home_channel, "env_vars": env_vars,
         # Multiplex secondary served on the default's shared listener: the vendor callback URL.
         "ingress_url": runtime_platform.get("ingress_url") if gateway_running else None,
+        # Setup-hidden knobs (not on the card); same row shape, settable via PUT.
+        "extra_env_vars": env_rows(entry.get("extra_env_vars", ())),
     }
     if platform_id == "whatsapp":
         whatsapp_mode = env_value("WHATSAPP_MODE").strip()
@@ -881,7 +931,8 @@ async def update_messaging_platform(platform_id: str, body: MessagingPlatformUpd
             )
             raise HTTPException(status_code=409, detail=conflict)
 
-    allowed_env = set(entry["env_vars"])
+    # Card fields plus the platform's setup-hidden knobs (home channel, allow-all, …).
+    allowed_env = set(entry["env_vars"]) | set(entry.get("extra_env_vars", ()))
 
     def _check_allowed(key: str) -> None:
         if key not in allowed_env:

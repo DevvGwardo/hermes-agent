@@ -338,3 +338,90 @@ def test_credential_write_on_default_profile_is_not_hot_served(client, isolated_
                       json={"enabled": True, "env": {"TELEGRAM_BOT_TOKEN": _VALID_WORKER_BOT_TOKEN}})
     assert resp.status_code == 200
     assert resp.json()["hot_served"] is False
+
+
+class TestAccessAndHomeEnvVars:
+    """Every platform's allowlist / allow-all / home-channel env vars (the names
+    the gateway actually reads) are settable through PUT, while the setup card
+    (``env_vars``) keeps hiding the self-configuring knobs."""
+
+    def test_catalog_lists_access_and_home_vars_for_every_platform(self):
+        from cron.scheduler_delivery import _HOME_TARGET_ENV_VARS
+        from gateway.pairing import _PLATFORM_ALLOWLIST_ENV
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        from hermes_cli.setup_hidden_env import is_setup_hidden_env
+        from hermes_cli.web_routers.messaging import _MESSAGING_ENV_FALLBACKS
+        from hermes_cli.web_server_messaging import _messaging_platform_catalog
+
+        for entry in _messaging_platform_catalog():
+            pid, card = entry["id"], set(entry["env_vars"])
+            settable = card | set(entry["extra_env_vars"])
+            assert not card & set(entry["extra_env_vars"]), pid
+            assert not any(is_setup_hidden_env(k) for k in card), pid
+            if allowlist := _PLATFORM_ALLOWLIST_ENV.get(pid):
+                assert allowlist in card, pid
+                assert allowlist.replace("_ALLOWED_USERS", "_ALLOW_ALL_USERS") in settable, pid
+            if home := _HOME_TARGET_ENV_VARS.get(pid):
+                assert home in settable, pid
+            for key in settable:  # plain-language label for every settable key
+                info = OPTIONAL_ENV_VARS.get(key) or _MESSAGING_ENV_FALLBACKS.get(key)
+                assert info and info.get("description") and info.get("prompt"), f"{pid}: {key}"
+
+    def test_email_card_and_extras(self):
+        from hermes_cli.web_server_messaging import _build_catalog_entry
+
+        email = _build_catalog_entry("email")
+        assert {"EMAIL_ALLOWED_USERS", "EMAIL_IMAP_PORT", "EMAIL_SMTP_PORT"} <= set(email["env_vars"])
+        assert {"EMAIL_ALLOW_ALL_USERS", "EMAIL_HOME_ADDRESS"} <= set(email["extra_env_vars"])
+
+    def test_put_sets_hidden_knobs_in_target_profile(self, client, isolated_profiles):
+        resp = client.put(
+            "/api/messaging/platforms/telegram",
+            json={"env": {"TELEGRAM_HOME_CHANNEL": "-100123", "TELEGRAM_ALLOW_ALL_USERS": "false"},
+                  "profile": "worker_alpha"},
+        )
+        assert resp.status_code == 200, resp.text
+        env_text = (isolated_profiles["worker_alpha"] / ".env").read_text(encoding="utf-8")
+        assert "TELEGRAM_HOME_CHANNEL=-100123" in env_text
+        assert "TELEGRAM_ALLOW_ALL_USERS=false" in env_text
+
+        telegram = _telegram(client.get(
+            "/api/messaging/platforms", params={"profile": "worker_alpha"}).json())
+        extras = {f["key"]: f for f in telegram["extra_env_vars"]}
+        assert extras["TELEGRAM_HOME_CHANNEL"]["is_set"] is True
+        assert extras["TELEGRAM_HOME_CHANNEL"]["prompt"]
+        assert "TELEGRAM_HOME_CHANNEL" not in {f["key"] for f in telegram["env_vars"]}
+
+        resp = client.put(
+            "/api/messaging/platforms/email",
+            json={"env": {"EMAIL_HOME_ADDRESS": "me@example.com", "EMAIL_IMAP_PORT": "993"},
+                  "profile": "worker_alpha"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_put_still_rejects_foreign_keys(self, client, isolated_profiles):
+        resp = client.put(
+            "/api/messaging/platforms/telegram",
+            json={"env": {"DISCORD_HOME_CHANNEL": "1"}, "profile": "worker_alpha"},
+        )
+        assert resp.status_code == 400
+
+    def test_access_and_home_values_are_plain_but_credentials_stay_redacted(self, client, isolated_profiles):
+        (isolated_profiles["worker_alpha"] / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_1234\n"
+            "TELEGRAM_ALLOWED_USERS=111,222\nTELEGRAM_HOME_CHANNEL=-100123\n"
+            "EMAIL_PASSWORD=hunter2-app-password\nEMAIL_IMAP_PORT=993\nEMAIL_HOME_ADDRESS=me@example.com\n",
+            encoding="utf-8")
+        platforms = {p["id"]: p for p in client.get(
+            "/api/messaging/platforms", params={"profile": "worker_alpha"}).json()["platforms"]}
+        rows = {f["key"]: f for pid in ("telegram", "email")
+                for f in platforms[pid]["env_vars"] + platforms[pid]["extra_env_vars"]}
+        assert rows["TELEGRAM_ALLOWED_USERS"]["value"] == "111,222"
+        assert rows["TELEGRAM_HOME_CHANNEL"]["value"] == "-100123"
+        assert rows["EMAIL_IMAP_PORT"]["value"] == "993"
+        assert rows["EMAIL_HOME_ADDRESS"]["value"] == "me@example.com"
+        assert rows["TELEGRAM_ALLOW_ALL_USERS"]["value"] == ""  # unset, still plain
+        for secret_key in ("TELEGRAM_BOT_TOKEN", "EMAIL_PASSWORD"):
+            assert "value" not in rows[secret_key]
+        payload = str(platforms["telegram"]) + str(platforms["email"])
+        assert "hunter2-app-password" not in payload and "ABCDEFGHIJKLMNOPQRSTUVWXYZ_1234" not in payload

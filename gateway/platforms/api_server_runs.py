@@ -26,6 +26,8 @@ except ImportError:
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+from gateway.platforms.api_server_run_prompts import (
+    CLIENT_CAPABILITIES_FIELD, CLIENT_CAPABILITIES_HEADER, RunPromptBroker, parse_client_capabilities)
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -229,6 +231,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
     ) = ({} for _ in range(7))
+    # Opt-in secret/clarify prompt brokers, keyed by run_id (only for runs whose client declared support).
+    self._run_prompt_brokers: dict[str, RunPromptBroker] = {}
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -236,6 +240,8 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+        ("POST", "/v1/runs/{run_id}/secret", self._handle_run_secret),
+        ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
 
@@ -501,6 +507,8 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    # Blocking prompt kinds the client declared it can answer ("clarify", "secret").
+    client_capabilities: frozenset = frozenset()
 
     @property
     def approval_session_key(self) -> str:
@@ -523,7 +531,7 @@ def _forget_run(self, run_id: str, *tables) -> None:
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+                self._stopping_run_ids, self._shutdown_interrupted_run_ids, self._run_prompt_brokers)
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -738,7 +746,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        turn_author=turn_author,
+        # Hosted-room members never get blocking prompts: a secret would land in the host's env.
+        client_capabilities=frozenset() if room_dispatch is not None else parse_client_capabilities(
+            request.headers.get(CLIENT_CAPABILITIES_HEADER), body.get(CLIENT_CAPABILITIES_FIELD)))
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
@@ -822,6 +833,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
                 resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
             register_gateway_notify(run.approval_session_key, approval_notify)
+            broker = self._run_prompt_brokers.get(run.run_id)
+            if broker is not None and "secret" in broker.capabilities:
+                from tools.skills_tool import bind_scoped_secret_capture_callback, reset_scoped_secret_capture_callback
+                resets.append((bind_scoped_secret_capture_callback(broker.secret_capture),
+                               reset_scoped_secret_capture_callback))
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
@@ -957,10 +973,15 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
+        broker = _make_prompt_broker(self, run) if run.client_capabilities else None
+        # Clarify is off the api_server toolset for plain clients; a declaring client gets it back.
+        extra = {"extra_toolsets": ["clarify"]} if broker and "clarify" in broker.capabilities else {}
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+                interim_assistant_callback=_interim_cb, **run.agent_kwargs, **extra)
+        if extra:
+            agent.clarify_callback = broker.clarify
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
@@ -998,9 +1019,38 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
+        _close_prompt_broker(self, run_id)
         with suppress(Exception):
             loop.call_soon(run.put_event, None)  # close after the queued events
         _retire_live_run(self, run_id)
+
+
+def _make_prompt_broker(self, run: _RunLaunch) -> RunPromptBroker:
+    """Per-run prompt broker whose events/status land on this run's stream (thread-safe)."""
+    run_id, loop = run.run_id, asyncio.get_running_loop()
+
+    def _emit(name: str, fields: Dict[str, Any]) -> None:
+        with suppress(Exception):
+            loop.call_soon_threadsafe(run.put_event, _run_event(run_id, name, **fields))
+
+    def _set_pending(summary: Optional[Dict[str, Any]]) -> None:
+        status = self._run_statuses.get(run_id)
+        if status is None:
+            return
+        if summary is None:
+            status.pop("pending_input", None)
+        else:
+            self._set_run_status(run_id, status.get("status", "running"),
+                                 last_event=f"{summary['kind']}.request", pending_input=summary)
+
+    broker = self._run_prompt_brokers[run_id] = RunPromptBroker(run.client_capabilities, _emit, _set_pending)
+    return broker
+
+
+def _close_prompt_broker(self, run_id: str) -> None:
+    broker = self._run_prompt_brokers.get(run_id)
+    if broker is not None:
+        broker.close()
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
@@ -1216,6 +1266,68 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         "resolved": resolved})
 
 
+async def _resolve_run_prompt(self, request: "web.Request", kind: str, value_key: str, *, _api_server):
+    """Shared body of POST /v1/runs/{id}/secret and /clarify (API-key auth, owning scope only)."""
+    _openai_error = _api_server._openai_error
+    run_id, _, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission=None, active_fallback=False)
+    if err is not None:
+        return None, err
+    body, err = await self._read_json_body(request)
+    if err:
+        return None, err
+    request_id = body.get("request_id")
+    raw_value = body.get(value_key, "")
+    if isinstance(raw_value, (list, dict)) and kind == "clarify":
+        raw_value = json.dumps(raw_value, ensure_ascii=False)  # multi-select array / whole-batch answers
+    question_id = body.get("question_id") or ""
+    broker = self._run_prompt_brokers.get(run_id)
+    for failed, message, code, status in (
+        (not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 256,
+         f"{kind.capitalize()} request_id is required.", f"invalid_{kind}_request", 400),
+        (raw_value is not None and not isinstance(raw_value, str),
+         f"'{value_key}' must be a string.", f"invalid_{kind}_{value_key}", 400),
+        (not isinstance(question_id, str), "'question_id' must be a string.", f"invalid_{kind}_request", 400),
+        (broker is None or kind not in broker.capabilities,
+         f"Run has no active {kind} prompts: {run_id}", f"{kind}_not_active", 409)):
+        if failed:
+            return None, _json_error(_openai_error, message, code=code, status=status)
+    error, remaining = broker.resolve(kind, request_id.strip(), raw_value or "", question_id)
+    if error == "unknown_question":
+        return None, _json_error(
+            _openai_error, f"Unknown question_id: {question_id}", code="invalid_clarify_question", status=400)
+    if error is not None:
+        return None, _json_error(
+            _openai_error, f"Run has no pending {kind} request {request_id}", code=f"{kind}_not_pending", status=409)
+    result: Dict[str, Any] = {"run_id": run_id, "request_id": request_id.strip()}
+    if kind == "secret":
+        result["skipped"] = not raw_value
+    if remaining is not None:
+        result.update(question_id=question_id, remaining=remaining)
+    return result, None
+
+
+async def _handle_run_secret(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """POST /v1/runs/{run_id}/secret — answer a ``secret.request`` ({request_id, value}; empty = skip)."""
+    result, err = await _resolve_run_prompt(self, request, "secret", "value", _api_server=_api_server)
+    if err is not None:
+        return err
+    # The value itself never leaves the handler: not echoed, logged, or evented.
+    _mark_run_event(self, result["run_id"], "secret.responded",
+                    request_id=result["request_id"], skipped=result["skipped"])
+    return web.json_response({"object": "hermes.run.secret_response", **result})
+
+
+async def _handle_run_clarify(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """POST /v1/runs/{run_id}/clarify — answer a ``clarify.request`` ({request_id, answer, question_id?})."""
+    result, err = await _resolve_run_prompt(self, request, "clarify", "answer", _api_server=_api_server)
+    if err is not None:
+        return err
+    _mark_run_event(self, result["run_id"], "clarify.responded",
+                    **{k: v for k, v in result.items() if k != "run_id"})
+    return web.json_response({"object": "hermes.run.clarify_response", **result})
+
+
 async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
@@ -1265,6 +1377,7 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
+    _close_prompt_broker(self, run_id)  # a blocked secret/clarify wait must not pin the stop
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")

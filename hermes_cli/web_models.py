@@ -353,6 +353,11 @@ class PairingApprove(BaseModel):
     request_id: str = ""
     profile: Optional[str] = None
 
+class PairingDeny(BaseModel):
+    platform: str
+    request_id: str
+    profile: Optional[str] = None
+
 class PairingRevoke(BaseModel):
     platform: str
     user_id: str
@@ -481,6 +486,9 @@ class SkillContentUpdate(BaseModel):
 class ToolsetToggle(BaseModel):
     enabled: bool
     profile: Optional[str] = None
+    # Messaging platform whose platform_toolsets entry to write (e.g. "telegram");
+    # omitted → the toolset's configuration platform (cli for most).
+    platform: Optional[str] = None
 
 class ToolsetProviderSelect(BaseModel):
     provider: str

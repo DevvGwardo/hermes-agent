@@ -27,7 +27,7 @@ from hermes_cli.web_server_gateway import _restart_gateway_after
 from hermes_cli.web_server_memory import _normalize_memory_provider_name, _require_memory_provider_ready
 from hermes_cli.web_models import (
     BackupRequest, CredentialPoolAdd, HookCreate, HookDelete, ImportRequest, MemoryProviderSelect,
-    MemoryReset, PairingApprove, PairingRevoke, WebhookCreate, WebhookEnabledToggle,
+    MemoryReset, PairingApprove, PairingDeny, PairingRevoke, WebhookCreate, WebhookEnabledToggle,
 )
 from hermes_cli.web_routers._common import (
     config_scoped_to_thread, config_write_scope, destructive_profile, http_failure,
@@ -111,6 +111,19 @@ async def approve_pairing(body: PairingApprove):
     raise HTTPException(
         status_code=404, detail=f"Pairing request or code not found or expired for platform '{platform}'.",
     )
+
+
+@router.post("/api/pairing/deny")
+async def deny_pairing(body: PairingDeny):
+    """Reject one pending request (by ``request_id`` from GET /api/pairing) without approving it."""
+    store = _pairing_store(body.profile)
+    platform = (body.platform or "").lower().strip()
+    request_id = (body.request_id or "").strip()
+    if not platform or not request_id:
+        raise HTTPException(status_code=400, detail="platform and request_id are required")
+    if (denied := store.deny_request(platform, request_id)) is not None:
+        return {"ok": True, "user": denied}
+    raise HTTPException(status_code=404, detail=f"Pairing request not found or expired for platform '{platform}'.")
 
 
 @router.post("/api/pairing/revoke")
@@ -534,6 +547,77 @@ async def reset_memory(body: MemoryReset, profile: Optional[str] = None):
                 except OSError as exc:
                     raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
         return {"ok": True, "deleted": deleted}
+
+    return await config_scoped_to_thread(profile, _run)
+
+
+# --- Memory write approval: when ``memory.write_approval`` is on, agent memory writes
+# are staged under <HERMES_HOME>/pending/memory/ instead of committed. These routes are
+# the REST face of ``/memory pending|approve|reject`` and share its handlers.
+
+_PENDING_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _memory_pending_view(rec: Dict[str, Any]) -> Dict[str, Any]:
+    payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+    action = payload.get("action") or rec.get("action") or ""
+    if action == "batch":
+        from tools.memory_tool import _batch_op_line
+        content = "\n".join(_batch_op_line(op) for op in payload.get("operations") or [])
+    else:
+        content = payload.get("content") or ""
+    from tools.memory_tool import destructive_ops
+    return {
+        "id": rec.get("id", ""), "target": payload.get("target") or "memory", "content": content,
+        "created_at": rec.get("created_at"), "action": action, "old_text": payload.get("old_text") or None,
+        # The full entries a replace/remove is pinned to (approval applies to these, not old_text).
+        "matched_entries": [op["matched_entry"] for op in destructive_ops(payload) if op.get("matched_entry")],
+        "summary": rec.get("summary", ""), "origin": rec.get("origin", "foreground")}
+
+
+def _require_memory_pending(pending_id: str) -> Dict[str, Any]:
+    from tools import write_approval as wa
+    rec = wa.get_pending(wa.MEMORY, pending_id) if _PENDING_ID_RE.match(pending_id) else None
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"No pending memory write with id '{pending_id}'")
+    return rec
+
+
+@router.get("/api/memory/pending")
+async def list_memory_pending(profile: Optional[str] = None):
+    from tools import write_approval as wa
+
+    def _run():
+        return {"pending": [_memory_pending_view(r) for r in wa.list_pending(wa.MEMORY)]}
+
+    return await config_scoped_to_thread(profile, _run)
+
+
+@router.post("/api/memory/pending/{pending_id}/approve")
+async def approve_memory_pending(pending_id: str, profile: Optional[str] = None):
+    from hermes_cli.write_approval_commands import approve_record
+    from tools import write_approval as wa
+    from tools.memory_tool import load_on_disk_store
+
+    def _run():
+        rec = _require_memory_pending(pending_id)
+        # Same as the gateway's /memory approve: a fresh on-disk store with configured limits.
+        ok, msg, _result = approve_record(wa.MEMORY, rec, load_on_disk_store())
+        if not ok:  # e.g. char limit exceeded / unpinned target — the record stays pending
+            raise HTTPException(status_code=409, detail=msg or "Could not apply pending memory write")
+        return {"ok": True}
+
+    return await config_scoped_to_thread(profile, _run)
+
+
+@router.post("/api/memory/pending/{pending_id}/reject")
+async def reject_memory_pending(pending_id: str, profile: Optional[str] = None):
+    from tools import write_approval as wa
+
+    def _run():
+        _require_memory_pending(pending_id)
+        wa.discard_pending(wa.MEMORY, pending_id)
+        return {"ok": True}
 
     return await config_scoped_to_thread(profile, _run)
 
