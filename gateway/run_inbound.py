@@ -114,7 +114,9 @@ class GatewayInboundMixin:
         code = pairing_store.generate_code(platform_name, source.user_id, source.user_name or "")
         adapter = self._delivery_adapter_for(source)
         if code:
-            reply = pairing_code_reply(platform_name, code, pairing_profile_arg(pairing_store))
+            reply = pairing_code_reply(
+                platform_name, code, pairing_profile_arg(pairing_store),
+                instructions=getattr(getattr(self, "config", None), "pairing_instructions", None))
         else:
             reply = PAIRING_RATE_LIMITED_REPLY
         if adapter:

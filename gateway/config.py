@@ -637,6 +637,9 @@ class GatewayConfig:
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
     unauthorized_dm_behavior: str = "pair"  # UNAUTHORIZED_DM_BEHAVIORS
     unauthorized_dm_decline_message: str = ""  # "decline" reply text; empty → DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE
+    # Template ({platform}, {code}) replacing the approval instructions in the pairing-code DM
+    # sent to unrecognized senders; None = default CLI instruction.
+    pairing_instructions: Optional[str] = None
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
@@ -650,6 +653,7 @@ class GatewayConfig:
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
         "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "unauthorized_dm_decline_message",
+        "pairing_instructions",
     )
 
     def __post_init__(self) -> None:
@@ -800,6 +804,9 @@ class GatewayConfig:
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), UNAUTHORIZED_DM_BEHAVIORS, "pair"),
             unauthorized_dm_decline_message=str(data.get("unauthorized_dm_decline_message") or "").strip(),
+            pairing_instructions=(
+                data["pairing_instructions"].strip() or None
+                if isinstance(data.get("pairing_instructions"), str) else None),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),

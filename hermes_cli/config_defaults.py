@@ -2073,7 +2073,11 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
-
+        # What an unrecognized DM sender is told to do with their pairing code. Blank = the
+        # default "run `hermes pairing approve <platform> <code>`" instruction. Set it when owners
+        # approve elsewhere (a hosted app, a web dashboard); {platform} and {code} are filled in,
+        # e.g. "Send code {code} to the owner so they can approve you in the app."
+        "pairing_instructions": "",
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,
