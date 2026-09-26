@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from tools import write_approval as wa
 
@@ -78,9 +78,8 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, failed, overwritten, removed = 0, [], [], []
     for rec in targets:
-        ok, msg, result = _apply_one(subsystem, rec, memory_store)
+        ok, msg, result = approve_record(subsystem, rec, memory_store)
         if ok:
-            wa.discard_pending(subsystem, rec["id"])
             applied += 1
             overwritten.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "replaced"))
             removed.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "removed"))
@@ -117,6 +116,15 @@ def _matched_entries(payload) -> List[str]:
     return [f"{op['action']}s entry: {op['matched_entry']}" if op.get("matched_entry")
             else f"{op['action']}: unpinned legacy target \u2014 reject and recreate before approving"
             for op in destructive_ops(payload)]
+
+
+def approve_record(subsystem: str, rec, memory_store) -> Tuple[bool, str, dict]:
+    """Apply one pending record and drop it on success; on failure it stays pending.
+    Shared by the slash commands and the dashboard REST routes. ``(ok, error, result)``."""
+    ok, msg, result = _apply_one(subsystem, rec, memory_store)
+    if ok:
+        wa.discard_pending(subsystem, rec["id"])
+    return ok, msg, result
 
 
 def _apply_one(subsystem: str, rec, memory_store):
