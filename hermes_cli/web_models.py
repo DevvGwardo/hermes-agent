@@ -333,6 +333,11 @@ class PairingApprove(BaseModel):
     request_id: str = ""
     profile: Optional[str] = None
 
+class PairingDeny(BaseModel):
+    platform: str
+    request_id: str
+    profile: Optional[str] = None
+
 class PairingRevoke(BaseModel):
     platform: str
     user_id: str

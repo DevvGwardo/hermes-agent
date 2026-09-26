@@ -27,7 +27,7 @@ from hermes_cli.web_server_gateway import _restart_gateway_after
 from hermes_cli.web_server_memory import _normalize_memory_provider_name, _require_memory_provider_ready
 from hermes_cli.web_models import (
     BackupRequest, CredentialPoolAdd, HookCreate, HookDelete, ImportRequest, MemoryProviderSelect,
-    MemoryReset, PairingApprove, PairingRevoke, WebhookCreate, WebhookEnabledToggle,
+    MemoryReset, PairingApprove, PairingDeny, PairingRevoke, WebhookCreate, WebhookEnabledToggle,
 )
 from hermes_cli.web_routers._common import (
     _CONFIG_MUTATION_LOCK, http_failure, scoped_to_thread, spawn_profile_action)
@@ -103,6 +103,19 @@ async def approve_pairing(body: PairingApprove):
     raise HTTPException(
         status_code=404, detail=f"Pairing request or code not found or expired for platform '{platform}'.",
     )
+
+
+@router.post("/api/pairing/deny")
+async def deny_pairing(body: PairingDeny):
+    """Reject one pending request (by ``request_id`` from GET /api/pairing) without approving it."""
+    store = _pairing_store(body.profile)
+    platform = (body.platform or "").lower().strip()
+    request_id = (body.request_id or "").strip()
+    if not platform or not request_id:
+        raise HTTPException(status_code=400, detail="platform and request_id are required")
+    if (denied := store.deny_request(platform, request_id)) is not None:
+        return {"ok": True, "user": denied}
+    raise HTTPException(status_code=404, detail=f"Pairing request not found or expired for platform '{platform}'.")
 
 
 @router.post("/api/pairing/revoke")

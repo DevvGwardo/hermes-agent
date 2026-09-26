@@ -523,6 +523,23 @@ class PairingStore:
                     return self._finish_approval(platform, pending, entry_id, entry)
             return None
 
+    def deny_request(self, platform: str, request_id: str) -> Optional[dict]:
+        """Drop one pending request by its request id without approving it. Returns the
+        removed ``{user_id, user_name}`` or ``None`` (unknown/expired). Same lockout-free
+        rationale as :meth:`approve_request`."""
+        with self._lock:
+            self._cleanup_expired(platform)
+            request_id = str(request_id or "").strip().lower()
+            if not request_id:
+                return None
+            pending = self._load_json(self._pending_path(platform))
+            for entry_id, entry in pending.items():
+                if _is_hashed_entry(entry) and secrets.compare_digest(str(entry_id).lower(), request_id):
+                    del pending[entry_id]
+                    self._save_json(self._pending_path(platform), pending)
+                    return {"user_id": entry.get("user_id", ""), "user_name": entry.get("user_name", "")}
+            return None
+
     def list_pending(self, platform: str = None) -> list:
         """List pending requests (codes are never returned; each exposes a ``request_id``
         for :meth:`approve_request`; legacy pre-hash entries report an empty id)."""

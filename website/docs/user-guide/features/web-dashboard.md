@@ -569,6 +569,7 @@ same auth gate as the rest of `/api/`.
 | `POST /api/messaging/platforms/{id}/test` | Report whether a channel is configured, enabled, and connected |
 | `GET /api/pairing` | List pending + approved messaging users |
 | `POST /api/pairing/approve` | Approve a code. Body: `{platform, code}` |
+| `POST /api/pairing/deny` | Reject one pending request without approving it. Body: `{platform, request_id, profile?}` (404 when unknown/expired) |
 | `POST /api/pairing/revoke` | Revoke a user. Body: `{platform, user_id}` |
 | `POST /api/pairing/clear-pending` | Drop all pending codes |
 | `GET /api/webhooks` | List subscriptions + platform-enabled status |
