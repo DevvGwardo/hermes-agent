@@ -439,6 +439,29 @@ class TestPairingEndpoints:
     def test_unknown_profile_is_rejected(self):
         assert self.client.get("/api/pairing?profile=ghost").status_code == 404
 
+    def test_deny_drops_only_that_request_in_the_named_profile(self):
+        from gateway.pairing import PairingStore
+        from hermes_constants import get_hermes_home
+
+        (get_hermes_home() / "profiles" / "work").mkdir(parents=True, exist_ok=True)
+        (get_hermes_home() / "profiles" / "work" / "config.yaml").write_text("{}\n")  # identity marker
+        work = PairingStore(profile="work")
+        work.generate_code("telegram", "deny-me", "Mallory")
+        work.generate_code("telegram", "keep-me", "Carol")
+        PairingStore().generate_code("telegram", "global-deny-me", "Other")
+        rows = {r["user_id"]: r for r in self.client.get("/api/pairing?profile=work").json()["pending"]}
+
+        body = {"platform": "telegram", "request_id": rows["deny-me"]["request_id"], "profile": "work"}
+        r = self.client.post("/api/pairing/deny", json=body)
+        assert r.status_code == 200 and r.json()["user"]["user_id"] == "deny-me"
+        remaining = [row["user_id"] for row in self.client.get("/api/pairing?profile=work").json()["pending"]]
+        assert remaining == ["keep-me"]
+        assert not PairingStore(profile="work").is_approved("telegram", "deny-me")
+        assert "global-deny-me" in [row["user_id"] for row in self.client.get("/api/pairing").json()["pending"]]
+        # Already denied (and never-issued) ids are 404, not a silent success.
+        assert self.client.post("/api/pairing/deny", json=body).status_code == 404
+        assert self.client.post("/api/pairing/deny", json={"platform": "telegram", "request_id": ""}).status_code == 400
+
 
 class TestWebhookEndpoints:
     @pytest.fixture(autouse=True)
