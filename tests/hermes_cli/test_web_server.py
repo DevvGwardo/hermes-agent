@@ -2933,6 +2933,34 @@ class TestNewEndpoints:
             config["platform_toolsets"]["discord"]
         )
 
+    def test_toolset_toggle_with_platform_writes_that_platform(self):
+        """``platform`` retargets the write from the configuration platform
+        (cli) to platform_toolsets.<platform>; cli stays untouched."""
+        from hermes_cli.config import load_config
+
+        cli_before = list(load_config().get("platform_toolsets", {}).get("cli") or [])
+        resp = self.client.put(
+            "/api/tools/toolsets/web", json={"enabled": False, "platform": "Telegram"})
+        assert resp.status_code == 200
+        assert resp.json()["platform"] == "telegram"
+        config = load_config()
+        assert "web" not in config["platform_toolsets"]["telegram"]
+        assert list(config["platform_toolsets"].get("cli") or []) == cli_before
+
+        resp = self.client.put(
+            "/api/tools/toolsets/web", json={"enabled": True, "platform": "telegram"})
+        assert resp.status_code == 200
+        assert "web" in load_config()["platform_toolsets"]["telegram"]
+
+    def test_toolset_toggle_rejects_bad_platform(self):
+        resp = self.client.put(
+            "/api/tools/toolsets/web", json={"enabled": True, "platform": "myspace"})
+        assert resp.status_code == 400
+        # Platform-restricted toolset on a platform it doesn't support.
+        resp = self.client.put(
+            "/api/tools/toolsets/discord", json={"enabled": True, "platform": "telegram"})
+        assert resp.status_code == 400
+
 
     def test_get_toolset_config_returns_provider_matrix(self):
         """GET .../config returns provider rows with structured env_vars."""
