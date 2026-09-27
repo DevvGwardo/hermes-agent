@@ -983,8 +983,12 @@ class TestSkillsEndpoint:
             {"name": "github", "description": "GitHub workflow skill", "category": "github"},
             {"name": "ascii-art", "description": "ASCII art generation", "category": "creative"},
         ]
+        # autospec: a bare MagicMock swallows ANY kwarg, so the handler could call
+        # _find_all_skills with an argument the real function does not accept and this
+        # test still passed while GET /v1/skills returned 500 in production.
         with patch(
             "tools.skills_tool._find_all_skills",
+            autospec=True,
             return_value=list(fake_skills),
         ):
             app = _create_app(adapter)
