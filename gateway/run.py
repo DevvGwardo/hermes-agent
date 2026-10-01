@@ -2109,6 +2109,8 @@ def _bridge_config_to_env(_cfg: dict) -> None:
     _tz_cfg = _cfg.get("timezone", "")
     if _tz_cfg and isinstance(_tz_cfg, str):
         os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
+        # Marks the value as a copy of config.yaml (hermes_time re-reads config when it changes).
+        os.environ["HERMES_TIMEZONE_FROM_CONFIG"] = _tz_cfg.strip()
     _security_cfg = _cfg.get("security", {})
     if isinstance(_security_cfg, dict) and _security_cfg.get("redact_secrets") is not None:
         os.environ["HERMES_REDACT_SECRETS"] = str(_security_cfg["redact_secrets"]).lower()

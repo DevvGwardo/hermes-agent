@@ -135,6 +135,7 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     if _tz_name and not _IS_WINDOWS:
         child_env["TZ"] = _tz_name
     child_env.pop("HERMES_TIMEZONE", None)
+    child_env.pop("HERMES_TIMEZONE_FROM_CONFIG", None)
     apply_subprocess_home_env(child_env)
     # Multiplexed gateway/Desktop (#110303): the server process env carries the machine-default
     # HERMES_HOME, but this turn runs under a per-profile override (ContextVar bound per turn).
