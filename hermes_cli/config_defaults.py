@@ -328,6 +328,9 @@ DEFAULT_CONFIG = {
         # Remote-backend sync-back refuses to extract a downloaded state archive larger than this
         # (bytes); raise it for a ~/.hermes tree that legitimately exceeds 2 GiB.
         "sync_back_max_bytes": 2 * 1024 * 1024 * 1024,
+        # Remote-backend sync-back pulls only user-facing cache files home by default. True also pulls
+        # back skill edits made inside the sandbox, bypassing skill_manage's scan (hermes-deploy#210).
+        "sync_back_skills": False,
         # HOME for host tool subprocesses: "auto" = host keeps the real OS-user HOME, containers use
         # HERMES_HOME/home; "real" = force real HOME; "profile" = force HERMES_HOME/home when it
         # exists (strict per-profile isolation).
