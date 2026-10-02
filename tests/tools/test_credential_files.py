@@ -332,7 +332,11 @@ class TestHermesInternalStateIsNeverMountable:
         for rel in ("config.yaml", "config.yml", "state.db", "state.db-wal", "state.db-shm",
                     "kanban.sqlite", ".hermes/license", ".hermes/lease-key.sh",
                     ".hermes/tool-sandbox/id_ed25519", "logs/agent.log",
-                    "profiles/work/google_token.json", "google_token.json"):
+                    "profiles/work/google_token.json", "google_token.json",
+                    "google_client_secret.json", "honcho.json", "slack_tokens.json",
+                    "gateway_state.json", "processes.json", "serve.token", "gateway.lock",
+                    "config.yaml.bak-20260904", ".env.bak", "kanban.db.bak",
+                    "pairing/telegram-approved.json", "cron/jobs.json"):
             (home / rel).parent.mkdir(parents=True, exist_ok=True)
             (home / rel).write_text("secret")
         (home / "innocent.json").symlink_to(home / "state.db")
@@ -345,6 +349,10 @@ class TestHermesInternalStateIsNeverMountable:
         ".hermes/tool-sandbox/id_ed25519", "logs/agent.log",
         "profiles/work/google_token.json", "logs/../config.yaml",
         "innocent.json", "keys/license",
+        # Stores Hermes and its bundled plugins write at the HERMES_HOME root.
+        "honcho.json", "slack_tokens.json", "gateway_state.json", "processes.json",
+        "serve.token", "gateway.lock", "config.yaml.bak-20260904", ".env.bak",
+        "kanban.db.bak", "pairing/telegram-approved.json", "cron/jobs.json",
     ])
     def test_internal_state_is_refused_from_skills_and_config(self, tmp_path, rel_path):
         import hermes_yaml as yaml
@@ -364,9 +372,11 @@ class TestHermesInternalStateIsNeverMountable:
         with patch.dict(os.environ, {"HERMES_HOME": str(home)}), \
                 caplog.at_level("WARNING", logger="tools.credential_files"):
             for _ in range(3):
-                register_credential_files(["config.yaml", "google_token.json"])
+                register_credential_files(["config.yaml", "google_token.json",
+                                           "google_client_secret.json"])
             mounts = get_credential_file_mounts()
-        assert [m["container_path"] for m in mounts] == ["/root/.hermes/google_token.json"]
+        assert sorted(m["container_path"] for m in mounts) == [
+            "/root/.hermes/google_client_secret.json", "/root/.hermes/google_token.json"]
         refusals = [r for r in caplog.records if "'config.yaml'" in r.getMessage()]
         assert len(refusals) == 1 and refusals[0].levelname == "WARNING"
 
