@@ -391,6 +391,24 @@ def _cache_dir_roots(container_base: str, *, create_missing: bool) -> Iterator[T
         yield host_dir, f"{base}/{new_subpath}"
 
 
+# Caches the host writes and later parses or replays as its own (web extract index and pages,
+# subagent summaries, spilled tool results). Sandboxes read them, but a remote copy must never
+# flow back: it would poison what every later session is served from the host.
+_HOST_CANONICAL_CACHE_DIRS = frozenset({"cache/web", "cache/delegation", "cache/spillover"})
+
+
+def get_skill_host_dirs() -> List[Path]:
+    """Host skills directories (local, external, trusted project-local) synced into sandboxes."""
+    return [host_dir for host_dir, _ in _skill_dir_roots("/root/.hermes")]
+
+
+def get_sync_back_cache_dirs() -> List[Path]:
+    """Host cache directories a remote sandbox may write new or changed files back into."""
+    return [host_dir for new_subpath, old_name in _CACHE_DIRS
+            if new_subpath not in _HOST_CANONICAL_CACHE_DIRS
+            for host_dir in [get_hermes_dir(new_subpath, old_name)]]
+
+
 def get_cache_directory_mounts(container_base: str = "/root/.hermes") -> List[Dict[str, str]]:
     """Bind-mount entries for each cache directory (host layout via ``get_hermes_dir``)."""
     return [_mount(h, c) for h, c in _cache_dir_roots(container_base, create_missing=True)]

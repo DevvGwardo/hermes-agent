@@ -52,6 +52,7 @@ _SYNC_BACK_MAX_RETRIES = 3
 _SYNC_BACK_BACKOFF = (2, 4, 8)  # seconds between retries
 _SYNC_BACK_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB — refuse to extract larger tars
 _SYNC_BACK_MAX_BYTES_KEY = "sync_back_max_bytes"  # config.yaml terminal.<key>
+_SYNC_BACK_SKILLS_KEY = "sync_back_skills"  # config.yaml terminal.<key>
 _SYNC_BACK_TEMP_PREFIX = "hermes-sync-back-"
 # A sync-back temp entry (the downloaded tar or the extraction staging dir) is only leaked by
 # a hard kill (SIGKILL/OOM/power loss — the ``finally`` never runs). Entry names embed the
@@ -74,6 +75,28 @@ def _sync_back_max_bytes() -> int:
         except (TypeError, ValueError):
             logger.warning("sync_back: ignoring non-integer terminal.%s=%r", _SYNC_BACK_MAX_BYTES_KEY, raw)
     return _SYNC_BACK_MAX_BYTES
+
+
+def _sync_back_skills_enabled() -> bool:
+    """config.yaml ``terminal.sync_back_skills`` (default off): pull sandbox skill edits home.
+
+    Off by default because the remote copy of the skills tree is writable by whatever runs in
+    the sandbox, and syncing it back would persist edits into every later session without
+    skill_manage's scan (Maia-VM/hermes-deploy#210)."""
+    from hermes_cli.config import load_config
+
+    return ((load_config() or {}).get("terminal") or {}).get(_SYNC_BACK_SKILLS_KEY) is True
+
+
+def _sync_back_allowed_roots() -> list[Path]:
+    """Host directories sync-back may write into: user-facing cache dirs, plus the skills
+    dirs when ``terminal.sync_back_skills`` is on. Everything else stays upload-only."""
+    from tools.credential_files import get_skill_host_dirs, get_sync_back_cache_dirs
+
+    roots = get_sync_back_cache_dirs()
+    if _sync_back_skills_enabled():
+        roots += get_skill_host_dirs()
+    return roots
 
 
 def _sync_back_temp_prefix() -> str:
@@ -161,6 +184,17 @@ def _credential_host_paths() -> set[str]:
         for entry in mounts if isinstance(entry, dict) and entry.get("host_path")}
 
 
+def _within_roots(host_path: str, roots: list[Path]) -> bool:
+    """True if *host_path* lands strictly inside one of the (realpath'd) *roots*.
+
+    Symlinks are followed on the host side, so a remote file mapped onto a host symlink (or
+    under a symlinked parent) is judged by where the write would really go."""
+    if os.path.islink(host_path):
+        return False
+    target = Path(os.path.realpath(host_path))
+    return any(target != root and target.is_relative_to(root) for root in roots)
+
+
 def quoted_rm_command(remote_paths: list[str]) -> str:
     """Build a shell ``rm -f`` command for a batch of remote paths."""
     return "rm -f " + " ".join(shlex.quote(p) for p in remote_paths)
@@ -197,12 +231,14 @@ class FileSyncManager:
         delete_fn: DeleteFn,
         sync_interval: float = _SYNC_INTERVAL_SECONDS,
         bulk_upload_fn: BulkUploadFn | None = None,
-        bulk_download_fn: BulkDownloadFn | None = None):
+        bulk_download_fn: BulkDownloadFn | None = None,
+        sync_back_roots_fn: Callable[[], list[Path]] | None = None):
         self._get_files_fn = get_files_fn
         self._upload_fn = upload_fn
         self._bulk_upload_fn = bulk_upload_fn
         self._bulk_download_fn = bulk_download_fn
         self._delete_fn = delete_fn
+        self._sync_back_roots_fn = sync_back_roots_fn
         self._transaction_lock = threading.Lock()
         self._synced_files: dict[str, tuple[float, int]] = {}  # remote_path -> (mtime, size)
         self._pushed_hashes: dict[str, str] = {}  # remote_path -> sha256 hex digest
@@ -414,18 +450,26 @@ class FileSyncManager:
                     tar.extractall(staging, filter="data")
 
                 upload_only = self._upload_only_host_paths | _credential_host_paths()
+                allowed_roots = [Path(os.path.realpath(root)) for root in (self._sync_back_roots_fn or _sync_back_allowed_roots)()]
                 applied = 0
+                refused: list[str] = []
                 for dirpath, _dirnames, filenames in os.walk(staging):
                     for fname in filenames:
                         staged_file = os.path.join(dirpath, fname)
                         # Remote keys are POSIX; relpath uses host separators (backslashes on Windows).
                         remote_path = "/" + Path(os.path.relpath(staged_file, staging)).as_posix()
-                        applied += self._apply_staged_file(staged_file, remote_path, file_mapping, upload_only)
+                        applied += self._apply_staged_file(
+                            staged_file, remote_path, file_mapping, upload_only, allowed_roots, refused)
 
                 if applied:
                     logger.info("sync_back: applied %d changed file(s)", applied)
                 else:
                     logger.debug("sync_back: no remote changes detected")
+                if refused:
+                    logger.warning(
+                        "sync_back: kept %d changed remote file(s) out of HERMES_HOME (only user-facing "
+                        "cache dirs sync back; set terminal.%s: true to also pull skill edits): %s",
+                        len(refused), _SYNC_BACK_SKILLS_KEY, ", ".join(refused[:10]))
         finally:
             try:
                 os.unlink(tar_path)
@@ -434,10 +478,12 @@ class FileSyncManager:
 
     def _apply_staged_file(
         self, staged_file: str, remote_path: str, file_mapping: list[tuple[str, str]], upload_only_host_paths: set[str],
+        allowed_roots: list[Path], refused: list[str],
     ) -> int:
         """Copy one extracted remote file onto the host if it changed since push. Returns 1 if
-        applied, 0 if skipped (unchanged, unmapped, or an upload-only credential). A host file
-        modified since push is overwritten with the remote version (last-write-wins) with a warning."""
+        applied, 0 if skipped (unchanged, unmapped, an upload-only credential, or outside
+        *allowed_roots*, which is also appended to *refused*). A host file modified since push
+        is overwritten with the remote version (last-write-wins) with a warning."""
         pushed_hash = self._pushed_hashes.get(remote_path)
         if pushed_hash is not None and _sha256_file(staged_file) == pushed_hash:
             return 0  # unchanged from push
@@ -451,6 +497,10 @@ class FileSyncManager:
 
         if self._is_upload_only_host_path(host_path, upload_only_host_paths):
             logger.debug("sync_back: skipping upload-only credential file %s", remote_path)
+            return 0
+
+        if not _within_roots(host_path, allowed_roots):
+            refused.append(remote_path)
             return 0
 
         if pushed_hash is not None and os.path.exists(host_path) and _sha256_file(host_path) != pushed_hash:

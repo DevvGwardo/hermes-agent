@@ -84,6 +84,8 @@ def _make_manager(
         upload_fn=MagicMock(),
         delete_fn=MagicMock(),
         bulk_download_fn=bulk_download_fn,
+        # Mechanics tests write under arbitrary tmp dirs; the HERMES_HOME policy has its own tests.
+        sync_back_roots_fn=lambda: [tmp_path],
     )
     if seed_pushed_state:
         # Seed _pushed_hashes so sync_back's "nothing previously pushed"
@@ -444,3 +446,55 @@ class TestSyncBackWindowsHost:
         mgr.sync_back(hermes_home=tmp_path / ".hermes")
         assert host_file.read_bytes() == b"v2"  # relpath key was 'root\\.hermes\\...' → skipped
         assert (tmp_path / "host" / "new.md").read_bytes() == b"new"  # _infer_host_path parent match
+
+
+class TestSyncBackHermesHomePolicy:
+    """A sandbox can write its copy of ~/.hermes; sync-back must not turn that into persistent
+    host state. Skills (unscanned, loaded by every later session), host-canonical caches and
+    everything outside the user-facing cache dirs stay upload-only unless explicitly opted in
+    (Maia-VM/hermes-deploy#210)."""
+
+    @staticmethod
+    def _sync_back(tmp_path, monkeypatch, *, sync_back_skills):
+        import hermes_yaml as yaml
+        home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        (home / "config.yaml").parent.mkdir(parents=True)
+        (home / "config.yaml").write_text(yaml.safe_dump({"terminal": {"sync_back_skills": sync_back_skills}}))
+        skill = home / "skills" / "notes" / "SKILL.md"
+        image = home / "cache" / "images" / "in.png"
+        web = home / "cache" / "web" / "index.json"
+        for path in (skill, image, web):
+            _write_file(path, b"v1")
+        # A host symlink inside an allowed dir must not redirect the write onto config.yaml.
+        (home / "cache" / "images" / "link.png").symlink_to(home / "config.yaml")
+        config_before = (home / "config.yaml").read_bytes()
+        remote = "/root/.hermes"
+        mapping = [(str(skill), f"{remote}/skills/notes/SKILL.md"), (str(image), f"{remote}/cache/images/in.png"),
+                   (str(web), f"{remote}/cache/web/index.json")]
+        mgr = FileSyncManager(get_files_fn=lambda: mapping, upload_fn=MagicMock(), delete_fn=MagicMock(),
+                              bulk_download_fn=_make_download_fn({
+                                  "root/.hermes/skills/notes/SKILL.md": b"tampered",
+                                  "root/.hermes/skills/notes/evil.py": b"tampered",
+                                  "root/.hermes/cache/images/out.png": b"generated",
+                                  "root/.hermes/cache/images/link.png": b"tampered",
+                                  "root/.hermes/cache/web/index.json": b"tampered"}))
+        for _host, remote_path in mapping:
+            mgr._pushed_hashes[remote_path] = _sha256_bytes(b"v1")
+        mgr.sync_back(hermes_home=home)
+        assert (home / "config.yaml").read_bytes() == config_before
+        assert web.read_bytes() == b"v1", "host-canonical cache must never be overwritten"
+        assert (home / "cache" / "images" / "out.png").read_bytes() == b"generated"
+        return home
+
+    def test_skills_and_host_state_stay_home_by_default(self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+            home = self._sync_back(tmp_path, monkeypatch, sync_back_skills=False)
+        assert (home / "skills" / "notes" / "SKILL.md").read_bytes() == b"v1"
+        assert not (home / "skills" / "notes" / "evil.py").exists()
+        assert any("sync_back_skills" in r.getMessage() for r in caplog.records)
+
+    def test_opt_in_pulls_skill_edits(self, tmp_path, monkeypatch):
+        home = self._sync_back(tmp_path, monkeypatch, sync_back_skills=True)
+        assert (home / "skills" / "notes" / "SKILL.md").read_bytes() == b"tampered"
+        assert (home / "skills" / "notes" / "evil.py").read_bytes() == b"tampered"
