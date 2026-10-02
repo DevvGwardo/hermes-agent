@@ -46,8 +46,44 @@ def _mount(host_path: Path | str, container_path: str) -> Dict[str, str]:
     return {"host_path": str(host_path), "container_path": container_path}
 
 
+# Hermes-internal state is never a skill's credential, however it is named in frontmatter or
+# ``terminal.credential_files`` (an agent can author a skill via skill_manage): config.yaml, the
+# license / lease key / tool-sandbox SSH key under ``.hermes/``, the SQLite stores, logs, other
+# profiles, sessions and memories (Maia-VM/hermes-deploy#210, #212).
+_INTERNAL_STATE_NAMES = frozenset({"config.yaml", "config.yml"})
+_INTERNAL_STATE_SUFFIXES = (".db", ".sqlite", ".sqlite3", "-wal", "-shm", "-journal")
+_INTERNAL_STATE_DIRS = frozenset({".hermes", "logs", "profiles", "sessions", "memories"})
+_MANAGED_CONFIG_DIR = Path("/etc/hermes")
+# Refusals are logged once per path; readiness probes re-resolve every skill's entries.
+_warned_internal: set[str] = set()
+
+
+def _internal_state_reason(rel: str, resolved: Path, hermes_home: Path) -> Optional[str]:
+    """Why *rel* (resolved to *resolved*, symlinks followed) is Hermes-internal state, else None.
+
+    Both the declared path and its resolved target are checked, so neither a symlink named
+    ``token.json`` pointing at ``state.db`` nor a declared ``logs/../config.yaml`` gets through.
+    """
+    declared = Path(posixpath.normpath(rel.replace(os.sep, "/")))
+    try:
+        target_parts = resolved.relative_to(hermes_home.resolve()).parts
+    except ValueError:
+        target_parts = ()
+    for name, parts in ((declared.name, declared.parts), (resolved.name, target_parts)):
+        name = name.lower()
+        if name in _INTERNAL_STATE_NAMES:
+            return "a Hermes config file"
+        if name.endswith(_INTERNAL_STATE_SUFFIXES):
+            return "a Hermes database file"
+        if parts and parts[0].lower() in _INTERNAL_STATE_DIRS:
+            return f"inside Hermes-internal {parts[0]}/"
+    if resolved == _MANAGED_CONFIG_DIR or _MANAGED_CONFIG_DIR in resolved.parents:
+        return "managed Hermes config under /etc/hermes"
+    return None
+
+
 def _contained_host_path(rel: str, hermes_home: Path, abs_msg: str, traversal_msg: str) -> Optional[Path]:
-    """Resolve *rel* under HERMES_HOME, refusing absolute paths and escapes."""
+    """Resolve *rel* under HERMES_HOME, refusing absolute paths, escapes and Hermes-internal state."""
     if os.path.isabs(rel):
         logger.warning(abs_msg, rel)
         return None
@@ -57,7 +93,14 @@ def _contained_host_path(rel: str, hermes_home: Path, abs_msg: str, traversal_ms
     if containment_error := validate_within_dir(host_path, hermes_home):
         logger.warning(traversal_msg, rel, containment_error)
         return None
-    return host_path.resolve()
+    resolved = host_path.resolve()
+    if reason := _internal_state_reason(rel, resolved, hermes_home):
+        if rel not in _warned_internal:
+            _warned_internal.add(rel)
+            logger.warning("credential_files: refused %r — it is %s, not a skill credential; "
+                           "it is never synced into a sandbox", rel, reason)
+        return None
+    return resolved
 
 
 def register_credential_file(relative_path: str, container_base: str = "/root/.hermes") -> bool:

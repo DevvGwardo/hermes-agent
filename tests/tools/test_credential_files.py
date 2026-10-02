@@ -25,6 +25,7 @@ def _clean_state():
     import tools.credential_files as _cred_mod
     clear_credential_files()
     _cred_mod._config_files = {}
+    _cred_mod._warned_internal.clear()
     yield
     clear_credential_files()
     _cred_mod._config_files = {}
@@ -318,6 +319,56 @@ class TestPathTraversalSecurity:
         # The resolved path escapes HERMES_HOME — must be rejected
         assert result is False
         assert get_credential_file_mounts() == []
+
+
+class TestHermesInternalStateIsNeverMountable:
+    """A skill (which the agent can write itself via skill_manage) must not be able to
+    name Hermes-internal state as a "credential file" and get it synced into a remote
+    sandbox: config, ``.hermes/`` keys, SQLite stores, logs (hermes-deploy#210, #212)."""
+
+    @staticmethod
+    def _home(tmp_path):
+        home = tmp_path / ".hermes"
+        for rel in ("config.yaml", "config.yml", "state.db", "state.db-wal", "state.db-shm",
+                    "kanban.sqlite", ".hermes/license", ".hermes/lease-key.sh",
+                    ".hermes/tool-sandbox/id_ed25519", "logs/agent.log",
+                    "profiles/work/google_token.json", "google_token.json"):
+            (home / rel).parent.mkdir(parents=True, exist_ok=True)
+            (home / rel).write_text("secret")
+        (home / "innocent.json").symlink_to(home / "state.db")
+        (home / "keys").symlink_to(home / ".hermes")
+        return home
+
+    @pytest.mark.parametrize("rel_path", [
+        "config.yaml", "config.yml", "state.db", "state.db-wal", "state.db-shm",
+        "kanban.sqlite", ".hermes/license", ".hermes/lease-key.sh",
+        ".hermes/tool-sandbox/id_ed25519", "logs/agent.log",
+        "profiles/work/google_token.json", "logs/../config.yaml",
+        "innocent.json", "keys/license",
+    ])
+    def test_internal_state_is_refused_from_skills_and_config(self, tmp_path, rel_path):
+        import hermes_yaml as yaml
+        import tools.credential_files as cf
+        home = self._home(tmp_path)
+        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+            assert register_credential_files([{"path": rel_path}]) == [rel_path]
+            assert get_credential_file_mounts() == []
+            # The user-config route goes through the same resolver.
+            (home / "config.yaml").write_text(
+                yaml.safe_dump({"terminal": {"credential_files": [rel_path]}}))
+            cf._config_files = {}
+            assert get_credential_file_mounts() == []
+
+    def test_refusal_warns_once_and_skill_token_still_mounts(self, tmp_path, caplog):
+        home = self._home(tmp_path)
+        with patch.dict(os.environ, {"HERMES_HOME": str(home)}), \
+                caplog.at_level("WARNING", logger="tools.credential_files"):
+            for _ in range(3):
+                register_credential_files(["config.yaml", "google_token.json"])
+            mounts = get_credential_file_mounts()
+        assert [m["container_path"] for m in mounts] == ["/root/.hermes/google_token.json"]
+        refusals = [r for r in caplog.records if "'config.yaml'" in r.getMessage()]
+        assert len(refusals) == 1 and refusals[0].levelname == "WARNING"
 
 
 # ---------------------------------------------------------------------------
