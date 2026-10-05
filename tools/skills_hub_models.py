@@ -46,6 +46,9 @@ class SkillBundle:
     identifier: str
     trust_level: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Keys of ``files`` that are executable at the source (git mode 100755, or an x bit on a local
+    # file). The byte map alone drops the mode, so ``quarantine_bundle`` restores it from here.
+    executable: set = field(default_factory=set)
 
 
 def _skill_meta_to_dict(meta: SkillMeta) -> dict:

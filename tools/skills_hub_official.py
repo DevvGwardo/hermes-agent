@@ -5,7 +5,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple, Union
 
 from agent.skill_utils import is_excluded_skill_path
-from tools.skills_hub_github import GitHubAuth, GitHubSource, _skip_bundle_file, _tree_members
+from tools.skills_hub_github import GitHubAuth, GitHubSource, _skip_bundle_file, _tree_executables, _tree_members
 from tools.skills_hub_models import (
     SkillBundle, SkillMeta, SkillSource, _hermes_tags, _matches_query, _memo_json, _parse_frontmatter, hub,
 )
@@ -124,13 +124,17 @@ class OptionalSkillSource(SkillSource):
         if upstream is not None:
             return self._fetch_from_upstream(upstream, rel_id)
         files: Dict[str, Union[str, bytes]] = {}
+        executable: set = set()
         for f in skill_dir.rglob("*"):
             if f.is_file() and not _skip_bundle_file(f.relative_to(skill_dir).as_posix()):
+                key = str(f.relative_to(skill_dir))
                 try:
-                    files[str(f.relative_to(skill_dir))] = f.read_bytes()
+                    files[key] = f.read_bytes()
+                    if f.stat().st_mode & 0o111:
+                        executable.add(key)
                 except OSError:
                     continue
-        return self._bundle(rel_id, files) if files else None
+        return self._bundle(rel_id, files, executable=executable) if files else None
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
         skill_name = self._rel(identifier).rsplit("/", 1)[-1]
@@ -175,7 +179,8 @@ class OptionalSkillSource(SkillSource):
         if tree is None:
             return None
         files: Dict[str, Union[str, bytes]] = {}
-        for rel_file, item_path, regular in _tree_members(tree[1], f"{self.OPTIONAL_SKILLS_PREFIX}/{rel}/"):
+        prefix = f"{self.OPTIONAL_SKILLS_PREFIX}/{rel}/"
+        for rel_file, item_path, regular in _tree_members(tree[1], prefix):
             if not regular or _skip_bundle_file(rel_file):
                 continue
             content = github._fetch_file_bytes(self.OFFICIAL_REPO, item_path)
@@ -190,7 +195,7 @@ class OptionalSkillSource(SkillSource):
         if upstream is not None:
             return self._fetch_from_upstream(upstream, rel)
         logger.info("Optional skill '%s' fetched from live repo (not in local checkout)", rel)
-        return self._bundle(rel, files)
+        return self._bundle(rel, files, executable=_tree_executables(tree[1], prefix, files))
 
     def _list_remote_skill_dirs(self) -> Dict[str, bool]:
         """``category/skill`` dirs under optional-skills/ on live main. One repo-tree call (cached
@@ -252,6 +257,7 @@ class OptionalSkillSource(SkillSource):
             # "trusted", not "builtin", so a dangerous scan verdict still blocks.
             trust_level="trusted",
             metadata={**bundle.metadata, "upstream_repo": upstream["repo"], "upstream_path": upstream["path"]},
+            executable=bundle.executable,
         )
 
     def _local_skill_mds(self):

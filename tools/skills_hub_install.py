@@ -64,6 +64,7 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
     skill_name = _validate_skill_name(bundle.name)
     # Validate every path before touching disk so a bad member aborts cleanly.
     validated_files = [(_validate_bundle_rel_path(rel_path), content) for rel_path, content in bundle.files.items()]
+    executable = {_validate_bundle_rel_path(rel_path) for rel_path in bundle.executable if rel_path in bundle.files}
     dest = _quarantine_dir() / skill_name
     if dest.exists():
         shutil.rmtree(dest)
@@ -77,7 +78,17 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
             # newline="" keeps the bundle's LF bytes verbatim; the default None mode would
             # translate to os.linesep on Windows and desync content_hash from bundle_content_hash.
             file_dest.write_text(file_content, encoding="utf-8", newline="")
+        if rel_path in executable:
+            _restore_executable_bit(file_dest)
     return dest
+
+
+def _restore_executable_bit(path: Path) -> None:
+    """Add execute wherever the umask-derived mode grants read (0644 -> 0755, 0600 -> 0700), as git
+    does on checkout. Without it a launcher the skill documents as ``scripts/run`` fails with
+    permission denied, and the guard's unexpected-executable check never sees the real mode."""
+    mode = path.stat().st_mode
+    path.chmod(mode | (mode & 0o444) >> 2)
 
 
 def _category_skill_dirs(directory: Path) -> List[str]:
