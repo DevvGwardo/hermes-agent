@@ -57,6 +57,14 @@ class OptionalSkillSource(SkillSource):
     def _rel(identifier: str) -> str:
         return identifier.split("/", 1)[-1] if identifier.startswith("official/") else identifier
 
+    @staticmethod
+    def _may_match_by_name(identifier: str) -> bool:
+        """``official/...`` and bare names may be located by skill name. Any other ``a/b`` identifier
+        (``owner/repo``, ``github/owner/repo``, a URL) names a skill elsewhere: only an exact
+        ``category/skill`` catalog path may claim it, never a catalog skill that merely shares its
+        last segment, or ``owner/impeccable`` would silently install the catalog's ``impeccable``."""
+        return identifier.startswith("official/") or "/" not in identifier
+
     def _meta(self, rel_dir: str, name: str, description: str, tags: list) -> SkillMeta:
         return SkillMeta(
             name=name, description=description, source="official", identifier=f"official/{rel_dir}",
@@ -109,9 +117,11 @@ class OptionalSkillSource(SkillSource):
 
         # Else try by bare skill name; if still absent, the skill may have landed on main
         # after this install was cut — use the live repo.
-        skill_dir = resolved if resolved.is_dir() else self._find_skill_dir(rel.rsplit("/", 1)[-1])
+        by_name = self._may_match_by_name(identifier)
+        skill_dir = resolved if resolved.is_dir() else (
+            self._find_skill_dir(rel.rsplit("/", 1)[-1]) if by_name else None)
         if not skill_dir:
-            return self._fetch_from_live_repo(rel)
+            return self._fetch_from_live_repo(rel, by_name=by_name)
         rel_id = skill_dir.resolve().relative_to(optional_root).as_posix()
 
         # Catalog stubs point at the real skill in an upstream-maintained repo
@@ -133,6 +143,10 @@ class OptionalSkillSource(SkillSource):
         return self._bundle(rel_id, files) if files else None
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        if not self._may_match_by_name(identifier):
+            rel = self._rel(identifier)
+            meta = next((m for m in self._scan_all() if m.identifier == f"official/{rel}"), None)
+            return meta or (self._remote_meta(rel) if rel in self._list_remote_skill_dirs() else None)
         skill_name = self._rel(identifier).rsplit("/", 1)[-1]
         for meta in self._scan_all():
             if meta.name == skill_name:
@@ -153,7 +167,7 @@ class OptionalSkillSource(SkillSource):
     def _remote_matches(self, name: str) -> List[str]:
         return [d for d in self._list_remote_skill_dirs() if d.rsplit("/", 1)[-1] == name]
 
-    def _fetch_from_live_repo(self, rel: str) -> Optional[SkillBundle]:
+    def _fetch_from_live_repo(self, rel: str, by_name: bool = True) -> Optional[SkillBundle]:
         """Fetch an optional skill straight from the live default branch. Local installs lag
         ``main``; rather than demanding ``hermes update`` first, resolve against the live repo.
         ``rel`` is ``category/skill`` (used verbatim) or a bare skill name (located via the repo tree)."""
@@ -163,6 +177,8 @@ class OptionalSkillSource(SkillSource):
         rel = "/".join(parts)
         github = self._get_github()
         if rel not in self._list_remote_skill_dirs():
+            if not by_name:
+                return None
             # Bare name (or stale category) — locate by final path segment.
             matches = self._remote_matches(parts[-1])
             if len(matches) != 1:
