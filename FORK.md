@@ -61,3 +61,4 @@ Every line that differs from upstream is a potential conflict on each sync.
   - `POST /api/pairing/deny`;
   - messaging catalog `extra_env_vars` and plain values for non-secret rows;
   - opt-in secret and clarify prompts on `/v1/runs`.
+- **Notification bell API for the Nub Agent app** (maiavm-desktop#17): `GET /api/notifications` and `POST /api/notifications/read` (`hermes_cli/web_routers/notifications.py`), plus the inbox and GitHub poller in `hermes_cli/notifications_bus.py`. Core because plugin routes skip dashboard auth. The only edits to upstream files are the router mount and the poller start/stop in `hermes_cli/web_server.py` (8 lines). `HERMES_NOTIFICATIONS_GITHUB=0` turns the poller off.
