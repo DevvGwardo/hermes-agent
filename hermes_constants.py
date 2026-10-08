@@ -598,6 +598,26 @@ def profile_cli_selector() -> str:
     return f"-p {name} " if name and name != "default" else ""
 
 
+def _owner_only_mode_keeping_acl(path, mode: int = 0o700) -> int:
+    """*mode* for an owner-only chmod of *path*, keeping an extended POSIX ACL working.
+
+    On a directory with an extended ACL the group permission bits ARE the ACL mask, so a plain
+    ``chmod 0700`` sets the mask to ``---`` and silently disables every named entry an operator
+    granted (e.g. ``setfacl -m u:hermes-tools:x /opt/data`` so a sandbox user can traverse to
+    its workspace). Keep the current group bits in that case; owner and other bits still come
+    from *mode*. Without an extended ACL (or off Linux) *mode* is returned unchanged.
+    """
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        return mode
+    try:
+        getxattr(path, "system.posix_acl_access")
+        current = os.stat(path).st_mode
+    except OSError:
+        return mode
+    return (mode & ~0o070) | (current & 0o070)
+
+
 def secure_parent_dir(path: Path) -> None:
     """Chmod ``0o700`` on *path*'s parent, refusing ``/`` and top-level dirs (misresolved HERMES_HOME)."""
     parent = path.parent.resolve()
@@ -616,7 +636,7 @@ def secure_parent_dir(path: Path) -> None:
         )
         return
     with contextlib.suppress(OSError):
-        os.chmod(parent, 0o700)
+        os.chmod(parent, _owner_only_mode_keeping_acl(parent))
 
 
 def _norm_home_path(path: str | None) -> str:
@@ -882,6 +902,10 @@ def apply_secure_dir_policy(path, *, home: str | Path | None = None) -> None:
         mode = int(explicit_mode or "700", 8)
     except ValueError:
         mode = 0o700
+    if not explicit_mode:
+        # The default owner-only policy must not disable an operator's ACL grants; an explicit
+        # HERMES_HOME_MODE is the operator's own choice and is applied exactly.
+        mode = _owner_only_mode_keeping_acl(path, mode)
     try:
         os.chmod(path, mode)
     except (OSError, NotImplementedError):

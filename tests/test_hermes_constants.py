@@ -373,6 +373,70 @@ class TestReasoningOverridesDefaultConfig:
         assert result2 == {"enabled": True, "effort": "low"}
 
 
+class TestOwnerOnlyModeKeepingAcl:
+    """An owner-only chmod must keep an extended ACL's mask (the group bits) intact."""
+
+    def _fake_acl(self, monkeypatch, path, st_mode):
+        real_stat = os.stat
+
+        def getxattr(p, name):
+            if str(p) == str(path) and name == "system.posix_acl_access":
+                return b"acl"
+            raise OSError(61, "No data available")
+
+        def fake_stat(p, *a, **kw):
+            if str(p) == str(path):
+                return os.stat_result((st_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            return real_stat(p, *a, **kw)
+
+        monkeypatch.setattr(os, "getxattr", getxattr, raising=False)
+        monkeypatch.setattr(os, "stat", fake_stat)
+
+    def test_plain_dir_gets_0700(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            os, "getxattr", lambda p, n: (_ for _ in ()).throw(OSError(61, "no acl")), raising=False
+        )
+        assert hermes_constants._owner_only_mode_keeping_acl(tmp_path) == 0o700
+
+    def test_acl_dir_keeps_mask(self, tmp_path, monkeypatch):
+        # mask r-x (group bits 0o050), others rwx: owner rwx forced, others cleared, mask kept.
+        self._fake_acl(monkeypatch, tmp_path, 0o40757)
+        assert hermes_constants._owner_only_mode_keeping_acl(tmp_path) == 0o750
+
+    def test_no_getxattr_returns_mode(self, tmp_path, monkeypatch):
+        monkeypatch.delattr(os, "getxattr", raising=False)
+        assert hermes_constants._owner_only_mode_keeping_acl(tmp_path) == 0o700
+
+    def test_home_policy_keeps_acl_mask(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_HOME_MODE", raising=False)
+        monkeypatch.setattr(hermes_constants, "get_managed_system", lambda home=None: None)
+        monkeypatch.setattr(hermes_constants, "_container_or_chmod_skipped", lambda: False)
+        self._fake_acl(monkeypatch, tmp_path, 0o40710)
+        calls = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: calls.append(m))
+        hermes_constants.apply_secure_dir_policy(tmp_path)
+        assert calls == [0o710]
+
+    def test_explicit_home_mode_wins_over_acl(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME_MODE", "0700")
+        monkeypatch.setattr(hermes_constants, "get_managed_system", lambda home=None: None)
+        monkeypatch.setattr(hermes_constants, "_container_or_chmod_skipped", lambda: False)
+        self._fake_acl(monkeypatch, tmp_path, 0o40710)
+        calls = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: calls.append(m))
+        hermes_constants.apply_secure_dir_policy(tmp_path)
+        assert calls == [0o700]
+
+    def test_secure_parent_dir_keeps_acl_mask(self, tmp_path, monkeypatch):
+        safe_dir = tmp_path / "opt" / "data"
+        safe_dir.mkdir(parents=True)
+        self._fake_acl(monkeypatch, safe_dir.resolve(), 0o40710)
+        calls = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: calls.append((str(p), m)))
+        secure_parent_dir(safe_dir / ".env")
+        assert calls == [(str(safe_dir.resolve()), 0o710)]
+
+
 class TestSecureParentDir:
     """Tests for secure_parent_dir() — prevents chmod on / or top-level dirs."""
 
