@@ -829,3 +829,65 @@ class TestAgentCacheMessageCountRebaseline:
         assert self._guard_would_reuse(runner, "telegram:s1", "s1") is True
         with runner._agent_cache_lock:
             assert runner._agent_cache["telegram:s1"][0] is agent
+
+
+class TestKeyCmdCredentialKeepsTheCachedAgent:
+    """A ``key_cmd`` provider resolves to a fresh ``CommandTokenSource`` on every turn, whose default
+    repr carries its memory address. Keyed on ``str(api_key)``, every Telegram turn rebuilt the cached
+    agent (cold prompt + one lease mint per turn) and overwrote the old entry without releasing it."""
+
+    SESSION_KEY = "agent:main:telegram:dm:1"
+
+    @staticmethod
+    def _runtime(command: str) -> dict:
+        from agent.command_token_source import CommandTokenSource
+
+        # A fresh source per call, as each runtime resolution produced. ``exit 9`` fails loudly if
+        # anything mints while keying the cache.
+        return {"api_key": CommandTokenSource(command, "maia"), "base_url": "https://proxy.example/v1",
+                "provider": "custom", "requested_provider": "custom:maia"}
+
+    def test_two_resolutions_of_one_key_cmd_share_a_signature(self):
+        from gateway.run import GatewayRunner
+
+        def sig(runtime):
+            return GatewayRunner._agent_config_signature("m", runtime, ["hermes-telegram"], "")
+
+        assert sig(self._runtime("exit 9")) == sig(self._runtime("exit 9"))
+        assert sig(self._runtime("exit 9")) != sig(self._runtime("exit 8"))
+
+    def test_turns_reuse_the_agent_and_a_replaced_agent_is_released(self):
+        from types import SimpleNamespace
+
+        from gateway.run_turn_runner import TurnRunner
+
+        runner = _make_runner()
+        runner._session_db = None
+        released = []
+        runner._release_evicted_agent_soft = released.append
+        runner._spawn_release_thread = lambda target, args, name, **kw: target(*args)
+        runner._running_agent_ids = lambda: set()
+        runner._enforce_agent_cache_cap = lambda: None
+        runner._init_cached_agent_for_turn = lambda agent, depth: None
+        runner._apply_fallback_chain_to_agent = lambda agent, chain: None
+        runner._refresh_fallback_model = lambda: None
+        ctx = SimpleNamespace(session_key=self.SESSION_KEY, session_id="sid-1", user_config={},
+                              enabled_toolsets=["hermes-telegram"], _interrupt_depth=0,
+                              source=SimpleNamespace(user_id="u1", user_id_alt=None))
+        turn = TurnRunner(runner, ctx)
+        built = []
+        turn._build_fresh_agent = lambda *a, **k: built.append(MagicMock()) or built[-1]
+
+        def run_turn(model):
+            route = {"model": model, "runtime": self._runtime("exit 9")}
+            return turn._resolve_turn_agent(route, "telegram", "", 10, None, {})
+
+        first, reused_first = run_turn("m")
+        for _ in range(3):
+            assert run_turn("m") == (first, True)
+        assert (reused_first, len(built), released) == (False, 1, [])
+
+        replacement, reused = run_turn("other-model")
+        assert (reused, replacement is first) == (False, False)
+        assert released == [first], "the replaced agent must be released, not just overwritten"
+        assert runner._agent_cache[self.SESSION_KEY][0] is replacement

@@ -155,6 +155,55 @@ class TestBuilder:
         assert build_command_token_provider("   ") is None
 
 
+class TestOneSourcePerCommandAndHome:
+    """Every runtime resolution asks for a provider, and the gateway API server builds a fresh agent
+    per request. A NEW source starts with an empty cache, so each resolution used to run the helper:
+    one lease mint per request instead of one per token lifetime."""
+
+    def test_repeated_resolutions_mint_once_per_token_lifetime(self, monkeypatch, tmp_path):
+        from hermes_cli import runtime_provider as rp
+
+        counter = tmp_path / "mints"
+        config = {
+            "providers": {
+                "dbx": {
+                    "base_url": "https://example.invalid/v1",
+                    "api_mode": "chat_completions",
+                    "model": "m1",
+                    "key_cmd": f"printf x >> {counter}; "
+                    """printf '{"access_token":"tok","expires_in":3600}'""",
+                }
+            }
+        }
+        monkeypatch.setattr(rp, "load_config", lambda *a, **k: config)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: config)
+
+        keys = [rp.resolve_runtime_provider(requested="custom:dbx")["api_key"] for _ in range(5)]
+        assert [key() for key in keys] == ["tok"] * 5
+        assert counter.read_text() == "x", "N resolutions inside one lifetime must mint once"
+
+        keys[0]._expires_at = time.monotonic() - 1  # cross the refresh point
+        assert keys[-1]() == "tok"
+        assert counter.read_text() == "xx", "the shared source must still re-mint before expiry"
+
+    def test_profiles_and_commands_never_share_a_source(self, tmp_path):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+        sources = []
+        for home in homes:
+            home.mkdir()
+            token = set_hermes_home_override(home)
+            try:
+                source = build_command_token_provider("printf tok", "dbx")
+                assert build_command_token_provider("printf tok", "dbx") is source
+                assert build_command_token_provider("printf other", "dbx") is not source
+                sources.append(source)
+            finally:
+                reset_hermes_home_override(token)
+        assert sources[0] is not sources[1], "a token minted for one profile must never serve another"
+
+
 
 class TestResolutionYieldsACallable:
     """The integration contract: a callable reaches the wire client."""

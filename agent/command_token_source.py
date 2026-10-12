@@ -16,6 +16,7 @@ import logging
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,30 @@ class CommandTokenSource:
             return token
 
 
+# One source per (command, label, Hermes home). Every runtime resolution asks for a provider (the API
+# server builds a fresh agent per request), and a NEW source has an empty cache, so without this each
+# request ran the helper. The home is part of the key because the helper runs with the served profile's
+# env: two profiles never share a token, even with the same command. Bounded: a process sees a handful.
+_SHARED_SOURCES: "OrderedDict[tuple[str, str, str], CommandTokenSource]" = OrderedDict()
+_SHARED_SOURCES_LOCK = threading.Lock()
+_SHARED_SOURCES_MAX = 64
+
+
 def build_command_token_provider(key_cmd: str, provider_label: str = "custom") -> Optional[CommandTokenSource]:
-    """A per-request token provider for *key_cmd*, or ``None`` when unset."""
+    """The token provider for *key_cmd* in the active Hermes home, or ``None`` when unset. Repeated
+    resolutions get the same source, so its token cache spans them (it still re-mints before expiry)."""
     command = str(key_cmd or "").strip()
-    return CommandTokenSource(command, provider_label) if command else None
+    if not command:
+        return None
+    from hermes_constants import hermes_home_key
+
+    key = (command, provider_label or "custom", hermes_home_key())
+    with _SHARED_SOURCES_LOCK:
+        source = _SHARED_SOURCES.get(key)
+        if source is None:
+            source = _SHARED_SOURCES[key] = CommandTokenSource(command, provider_label)
+            while len(_SHARED_SOURCES) > _SHARED_SOURCES_MAX:
+                _SHARED_SOURCES.popitem(last=False)
+        else:
+            _SHARED_SOURCES.move_to_end(key)
+        return source
