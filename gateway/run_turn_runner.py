@@ -1052,7 +1052,15 @@ class TurnRunner:
             return out
         with cache_lock:
             cached = cache.get(ctx.session_key)
-            if not (cached and cached[1] == sig):
+            if not cached:
+                return out
+            if cached[1] != sig:
+                # Config changed: the fresh agent built next replaces this entry, so evict and
+                # release the old one here — overwriting the tuple would leak its client pool.
+                # A mid-turn agent is never torn down (same rule as ``_evict_cached_agent``).
+                logger.info("Agent cache invalidated for session %s: config signature changed", ctx.session_key)
+                if id(cached[0]) not in self._runner._running_agent_ids():
+                    out.evicted = self._pop_cached_agent_for_eviction()
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1093,10 +1101,11 @@ class TurnRunner:
         return out
 
     def _release_evicted_agent(self, agent) -> None:
-        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop."""
+        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop, under
+        the profile that owns the session (as ``_evict_cached_agent`` does)."""
         self._runner._spawn_release_thread(
             self._runner._release_evicted_agent_soft, (agent,), f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
-            inline_fallback=True,
+            inline_fallback=True, session_key=self._ctx.session_key,
         )
 
     def _build_fresh_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations,

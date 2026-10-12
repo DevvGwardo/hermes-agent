@@ -116,9 +116,14 @@ class GatewayAgentCacheMixin:
         threads trade prompt-cache warmth for correct memory attribution.
         """
         import hashlib, json as _j
+        from agent.command_token_source import CommandTokenSource
         # Fingerprint the FULL credential, not a short prefix: OAuth/JWT-style tokens often share a
         # common prefix (e.g. "eyJhbGci"), so a prefix would give false cache hits across auth switches.
-        _api_key = str(runtime.get("api_key", "") or "")
+        # A ``key_cmd`` credential is a callable whose default repr carries its memory address, and
+        # every runtime resolution may build a new one: key on its command identity instead (never on
+        # a minted token, which would also mint on a cache read), or every turn rebuilds the agent.
+        _raw_key = runtime.get("api_key", "")
+        _api_key = _raw_key.cache_identity if isinstance(_raw_key, CommandTokenSource) else str(_raw_key or "")
         blob = _j.dumps(
             [
                 model,
