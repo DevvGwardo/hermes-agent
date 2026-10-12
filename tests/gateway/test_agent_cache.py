@@ -891,3 +891,41 @@ class TestKeyCmdCredentialKeepsTheCachedAgent:
         assert (reused, replacement is first) == (False, False)
         assert released == [first], "the replaced agent must be released, not just overwritten"
         assert runner._agent_cache[self.SESSION_KEY][0] is replacement
+
+    def test_an_agent_replaced_mid_turn_is_released_once_that_turn_ends(self):
+        from types import SimpleNamespace
+
+        from gateway.run_turn_runner import TurnRunner
+
+        runner = _make_runner()
+        runner._session_db = None
+        released, spawned = [], []
+        runner._release_evicted_agent_soft = released.append
+        runner._spawn_release_thread = lambda target, args, name, **kw: spawned.append((target, args))
+        running = set()
+        runner._running_agent_ids = lambda: set(running)
+        runner._enforce_agent_cache_cap = lambda: None
+        runner._init_cached_agent_for_turn = lambda agent, depth: None
+        runner._apply_fallback_chain_to_agent = lambda agent, chain: None
+        runner._refresh_fallback_model = lambda: None
+        ctx = SimpleNamespace(session_key=self.SESSION_KEY, session_id="sid-1", user_config={},
+                              enabled_toolsets=["hermes-telegram"], _interrupt_depth=0,
+                              source=SimpleNamespace(user_id="u1", user_id_alt=None))
+        turn = TurnRunner(runner, ctx)
+        turn._MIDTURN_RELEASE_POLL_S = 0.0
+        built = []
+        turn._build_fresh_agent = lambda *a, **k: built.append(MagicMock()) or built[-1]
+
+        def run_turn(model):
+            return turn._resolve_turn_agent({"model": model, "runtime": self._runtime("exit 9")}, "telegram", "", 10, None, {})
+
+        first, _ = run_turn("m")
+        running.add(id(first))  # still mid-turn when the config changes
+        replacement, _ = run_turn("other-model")
+        assert runner._agent_cache[self.SESSION_KEY][0] is replacement
+        assert released == [], "never torn down under a live turn"
+        assert len(spawned) == 1
+        running.discard(id(first))  # its turn ends
+        target, args = spawned[0]
+        target(*args)
+        assert released == [first]

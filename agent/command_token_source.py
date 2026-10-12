@@ -115,12 +115,17 @@ def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
 class CommandTokenSource:
     """Callable returning a bearer token, cached until shortly before expiry."""
 
-    def __init__(self, command: str, label: str = "custom") -> None:
+    def __init__(self, command: str, label: str = "custom", home_override: Optional[str] = None) -> None:
         self._command = command
         self._label = label or "custom"
         self._lock = threading.Lock()
         self._token = ""
         self._expires_at: float = 0.0
+        # The profile this source mints FOR, fixed when it is built (None = the launch profile). One
+        # source serves many resolutions (build_command_token_provider), so a mint must not follow
+        # whichever home override happens to be active on the calling thread: a token minted with
+        # another profile's credentials would be cached here and served to this profile.
+        self._home_override = home_override
 
     @property
     def cache_identity(self) -> str:
@@ -131,7 +136,7 @@ class CommandTokenSource:
         with self._lock:
             if self._token and time.monotonic() < self._expires_at:
                 return self._token
-            token, ttl = _mint(self._command, self._label)
+            token, ttl = self._mint_for_own_profile()
             self._token = token
             self._expires_at = time.monotonic() + (
                 max(ttl - _TOKEN_REFRESH_LEEWAY_SECONDS, 5.0) if ttl else _NO_TTL_REFRESH_SECONDS
@@ -141,6 +146,25 @@ class CommandTokenSource:
                 self._label, f"{int(ttl)}s" if ttl else "unknown",
             )
             return token
+
+
+    def _mint_for_own_profile(self) -> tuple[str, Optional[float]]:
+        """``_mint`` under this source's own profile: its pinned home, or the launch home when it was
+        built for the launch profile but is called under another profile's override."""
+        from hermes_constants import (
+            get_hermes_home_override, get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override)
+
+        current = get_hermes_home_override()
+        want = self._home_override
+        if want is None and current is not None:
+            want = str(get_process_hermes_home())
+        if want is None or want == current:
+            return _mint(self._command, self._label)
+        reset_token = set_hermes_home_override(want)
+        try:
+            return _mint(self._command, self._label)
+        finally:
+            reset_hermes_home_override(reset_token)
 
 
 # One source per (command, label, Hermes home). Every runtime resolution asks for a provider (the API
@@ -158,13 +182,14 @@ def build_command_token_provider(key_cmd: str, provider_label: str = "custom") -
     command = str(key_cmd or "").strip()
     if not command:
         return None
-    from hermes_constants import hermes_home_key
+    from hermes_constants import get_hermes_home_override, hermes_home_key
 
     key = (command, provider_label or "custom", hermes_home_key())
     with _SHARED_SOURCES_LOCK:
         source = _SHARED_SOURCES.get(key)
         if source is None:
-            source = _SHARED_SOURCES[key] = CommandTokenSource(command, provider_label)
+            source = _SHARED_SOURCES[key] = CommandTokenSource(
+                command, provider_label, home_override=get_hermes_home_override())
             while len(_SHARED_SOURCES) > _SHARED_SOURCES_MAX:
                 _SHARED_SOURCES.popitem(last=False)
         else:

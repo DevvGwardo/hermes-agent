@@ -203,6 +203,37 @@ class TestOneSourcePerCommandAndHome:
                 reset_hermes_home_override(token)
         assert sources[0] is not sources[1], "a token minted for one profile must never serve another"
 
+    def test_a_source_mints_under_its_own_profile_whatever_the_calling_thread_has(self, tmp_path, monkeypatch):
+        from agent import command_token_source as cts
+        from hermes_constants import (
+            get_hermes_home_override, get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override)
+
+        seen = []
+
+        def mint(command, label):
+            seen.append(get_hermes_home_override())
+            return "tok", None
+
+        monkeypatch.setattr(cts, "_mint", mint)
+        a, b = tmp_path / "profile-a", tmp_path / "profile-b"
+        a.mkdir()
+        b.mkdir()
+        token = set_hermes_home_override(a)
+        try:
+            for_a = cts.CommandTokenSource("printf tok", "dbx", home_override=get_hermes_home_override())
+        finally:
+            reset_hermes_home_override(token)
+        for_launch = cts.CommandTokenSource("printf tok", "dbx")
+
+        for_a()  # a bare thread: no override at all
+        token = set_hermes_home_override(b)
+        try:
+            for_launch()  # built for the launch profile, called under profile B
+        finally:
+            reset_hermes_home_override(token)
+        assert seen == [str(a), str(get_process_hermes_home())]
+        assert get_hermes_home_override() is None, "the override must be restored after the mint"
+
 
 
 class TestResolutionYieldsACallable:
