@@ -993,6 +993,7 @@ class TurnRunner:
         agent: Any = None
         reused: bool = False
         evicted: Any = None  # agent evicted under the lock; released off-lock on a daemon thread
+        evicted_running: Any = None  # evicted while mid-turn; released once that turn ends
 
     def _skip_context_files(self, platform_key) -> bool:
         """gateway.platforms.<plat>.skip_context_files: messaging platforms may opt out of
@@ -1059,8 +1060,11 @@ class TurnRunner:
                 # release the old one here — overwriting the tuple would leak its client pool.
                 # A mid-turn agent is never torn down (same rule as ``_evict_cached_agent``).
                 logger.info("Agent cache invalidated for session %s: config signature changed", ctx.session_key)
-                if id(cached[0]) not in self._runner._running_agent_ids():
-                    out.evicted = self._pop_cached_agent_for_eviction()
+                evicted = self._pop_cached_agent_for_eviction()
+                if evicted is not None and id(evicted) in self._runner._running_agent_ids():
+                    out.evicted_running = evicted
+                else:
+                    out.evicted = evicted
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1099,6 +1103,29 @@ class TurnRunner:
                 return out
             out.evicted = self._pop_cached_agent_for_eviction()
         return out
+
+    _MIDTURN_RELEASE_POLL_S = 5.0
+    _MIDTURN_RELEASE_MAX_WAIT_S = 3 * 3600.0
+
+    def _release_evicted_agent_when_idle(self, agent) -> None:
+        """A config change replaced an agent that is still mid-turn (the fresh one now owns the cache
+        slot). Never tear it down under a live turn: wait off-thread until it leaves the running set,
+        then soft-release it, instead of leaking its client pool to the GC. Gives up after the cap."""
+        runner = self._runner
+
+        def _wait_then_release(a) -> None:
+            deadline = time.monotonic() + self._MIDTURN_RELEASE_MAX_WAIT_S
+            while id(a) in runner._running_agent_ids():
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(self._MIDTURN_RELEASE_POLL_S)
+            runner._release_evicted_agent_soft(a)
+
+        with suppress(Exception):
+            runner._spawn_release_thread(
+                _wait_then_release, (agent,), f"agent-midturn-evict-{str(self._ctx.session_key)[:24]}",
+                inline_fallback=False, session_key=self._ctx.session_key,
+            )
 
     def _release_evicted_agent(self, agent) -> None:
         """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop, under
@@ -1164,6 +1191,8 @@ class TurnRunner:
             self._runner._apply_fallback_chain_to_agent(agent, runner._refresh_fallback_model())
         if found.evicted is not None:
             self._release_evicted_agent(found.evicted)
+        if found.evicted_running is not None:
+            self._release_evicted_agent_when_idle(found.evicted_running)
         if agent is None:
             agent = self._build_fresh_agent(
                 turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr, skip_context_files,
