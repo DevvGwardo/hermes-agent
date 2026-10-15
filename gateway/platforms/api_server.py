@@ -4493,6 +4493,28 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # After native routes: Relay bootstrap shims feature-detect on this key and must
             # no-op rather than shadow the native session-control handlers.
             self._app["api_server_adapter"] = self
+            # maiavm-native-dashboard-runs: the Nub dashboard runs API (append-only
+            # event log per run, Last-Event-Id resumption) so a run survives the
+            # platform's function timeouts and viewer disconnects. hermes-deploy
+            # used to patch this in on every VM; the marker on the first line tells
+            # its installer and overlay repair to leave this checkout alone. The
+            # `_dash_register` name keeps older repair scripts from patching twice.
+            # See gateway/platforms/dashboard_runs.py.
+            if getattr(self, "_dashboard_run_registry", None) is None:
+                try:
+                    from gateway.platforms.run_buffer import RunBufferRegistry as _RunBufferRegistry
+                    self._dashboard_run_registry = _RunBufferRegistry()
+                except Exception as _exc:  # pragma: no cover - import guard
+                    logger.warning("[api_server] dashboard run registry disabled: %s", _exc)
+                    self._dashboard_run_registry = None
+            if getattr(self, "_dashboard_run_registry", None) is not None:
+                try:
+                    from gateway.platforms.dashboard_runs import register_routes as _dash_register
+                    _dash_register(self._app, self, self._dashboard_run_registry)
+                    self._dashboard_run_registry.start_sweeper(asyncio.get_running_loop())
+                    logger.info("[api_server] /v1/dashboard/runs routes registered")
+                except Exception as _dash_exc:  # pragma: no cover
+                    logger.warning("[api_server] failed to register dashboard runs: %s", _dash_exc)
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
             self._track_background_task(asyncio.create_task(self._sweep_orphaned_runs()))
