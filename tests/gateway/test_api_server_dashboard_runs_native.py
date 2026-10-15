@@ -60,3 +60,13 @@ async def test_connect_registers_dashboard_runs_routes():
                 assert res.status == 401
     finally:
         await adapter.disconnect()
+
+
+def test_events_resume_cursor_contract():
+    # hermes-deploy resumes a stream with ?after=<last event id> (withAfterCursor,
+    # src/lib/chat-runs.ts) as well as Last-Event-Id. Keep both.
+    from gateway.platforms import dashboard_runs
+
+    src = inspect.getsource(dashboard_runs)
+    assert 'request.query.get("after")' in src
+    assert "Last-Event-Id" in src
