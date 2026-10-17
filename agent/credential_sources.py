@@ -109,9 +109,11 @@ def _remove_env_source(provider: str, removed) -> RemovalResult:
     try:
         env_path = get_env_path()
         if env_path.exists():
+            from agent.secret_scope import split_env_lines
+
             env_in_dotenv = any(
                 line.strip().startswith(f"{env_var}=")
-                for line in env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+                for line in split_env_lines(env_path.read_text(encoding="utf-8-sig", errors="replace"))
             )
     except OSError:
         pass

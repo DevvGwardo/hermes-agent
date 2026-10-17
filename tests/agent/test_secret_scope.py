@@ -368,6 +368,13 @@ class TestEnvFileParsing:
             assert parsed["A"] == f"ok{sep}GITHUB_TOKEN=gh_evil #"
             assert {k: parsed[k] for k in "BCD"} == {"B": "2", "C": "3", "D": "4"}
 
+    def test_split_env_lines_is_splitlines_shaped_on_dotenv_boundaries(self):
+        """Same list ``str.splitlines()`` gives for CR/LF text (no trailing empty line), so the
+        rewriters that copy lines through keep the file's shape; only \\r\\n, \\r and \\n split."""
+        for text in ("", "A=1", "A=1\n", "A=1\n\nB=2\r\n", "A=1\rB=2\n\n"):
+            assert ss.split_env_lines(text) == text.splitlines(), repr(text)
+        assert ss.split_env_lines("A=ok\x1cB=2\u2028C=3\n") == ["A=ok\x1cB=2\u2028C=3"]
+
     def test_strips_utf8_bom_from_first_key(self, tmp_path):
         """Windows editors often save .env as UTF-8 with BOM (EF BB BF).
 

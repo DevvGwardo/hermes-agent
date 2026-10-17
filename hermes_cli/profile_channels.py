@@ -290,8 +290,10 @@ def strip_channel_env_file(env_path: Path, index: Optional[ChannelKeyIndex] = No
     index = index or ChannelKeyIndex()
     removed: Dict[str, List[str]] = {}
     kept: List[str] = []
+    from agent.secret_scope import split_env_lines
+
     text = env_path.read_text(encoding="utf-8-sig", errors="replace")
-    for line in text.splitlines():
+    for line in split_env_lines(text):
         key = _env_key_of_line(line)
         platform = index.platform_for(key) if key else None
         if key is None or platform is None:
@@ -396,7 +398,9 @@ def channel_platforms_configured(profile_dir: Path) -> List[str]:
     found: Set[str] = set()
     env_path = profile_dir / ".env"
     if env_path.is_file():
-        for line in env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        from agent.secret_scope import split_env_lines
+
+        for line in split_env_lines(env_path.read_text(encoding="utf-8-sig", errors="replace")):
             key = _env_key_of_line(line)
             platform = index.platform_for(key) if key else None
             if platform and platform != GATEWAY_POLICY_ID:

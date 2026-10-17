@@ -138,9 +138,13 @@ def build_oss_config(flags: dict[str, str]) -> tuple[dict, dict[str, str]]:
 
 
 def _write_env(env_path: Path, env_writes: dict[str, str]) -> None:
+    from agent.secret_scope import split_env_lines, strip_env_line_breaks
+
     env_path.parent.mkdir(parents=True, exist_ok=True)
     # utf-8-sig like the canonical .env readers: a BOM'd first line would miss the key match and get duplicated.
-    existing_lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.exists() else []
+    existing_lines = split_env_lines(env_path.read_text(encoding="utf-8-sig")) if env_path.exists() else []
+    # One value, one line: a line break inside a value would start a second ``KEY=``.
+    env_writes = {k: strip_env_line_breaks(v) for k, v in env_writes.items()}
     keys = [line.split("=", 1)[0].strip() if "=" in line and not line.startswith("#") else None for line in existing_lines]
     new_lines = [f"{k}={env_writes[k]}" if k in env_writes else line for k, line in zip(keys, existing_lines)]
     new_lines += [f"{k}={v}" for k, v in env_writes.items() if k not in keys]

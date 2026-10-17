@@ -1799,6 +1799,20 @@ class TestOpenVikingEnvWriter:
 
         assert env.read_bytes() == f"NAME=caf\xe9{os.linesep}OPENAI_API_KEY=new{os.linesep}".encode("latin-1")
 
+    def test_value_with_splitlines_only_boundary_is_copied_through_whole(self, tmp_path):
+        """A dotenv line holding \\x1c is one line; a ``splitlines()`` read rewrote it as two, turning
+        a harmless value into a real ``GITHUB_TOKEN=`` line."""
+        from plugins.memory.openviking import _write_env_vars
+
+        env = tmp_path / ".env"
+        env.write_text("NOTE=a\x1cGITHUB_TOKEN=gh_evil\nOPENAI_API_KEY=old\n", encoding="utf-8")
+
+        _write_env_vars(env, {"OPENAI_API_KEY": "new"})
+
+        assert env.read_text(encoding="utf-8").split(os.linesep) == [
+            "NOTE=a\x1cGITHUB_TOKEN=gh_evil", "OPENAI_API_KEY=new", "",
+        ]
+
     def test_plain_env_is_unchanged_apart_from_the_write(self, tmp_path):
         from plugins.memory.openviking import _write_env_vars
 

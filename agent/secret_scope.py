@@ -313,16 +313,32 @@ def _decode_env_bytes(raw: bytes) -> str:
         return raw.decode("latin-1")
 
 
-# Universal newlines, as ``open()`` and python-dotenv split: ``str.splitlines()`` also breaks on
-# \v, \f, \x1c-\x1e, U+0085, U+2028 and U+2029, which would read a key hidden inside a value that
-# ``os.environ`` holds as one line.
+# A ``.env`` line ends where ``open()`` and python-dotenv end it: \r\n, \r or \n. ``str.splitlines()``
+# also breaks on \v, \f, \x1c-\x1e, U+0085, U+2028 and U+2029, so a value holding one of those is one
+# line to ``os.environ`` but two to a splitlines() reader: a second ``KEY=`` could hide inside it.
+# Readers split with ``_ENV_LINE_RE``; writers drop every splitlines() boundary from a value.
 _ENV_LINE_RE = re.compile(r"\r\n|\r|\n")
+_ENV_VALUE_LINE_BREAKS = str.maketrans("", "", "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
+
+def strip_env_line_breaks(value: str) -> str:
+    """Drop every line boundary from a value bound for a single ``.env`` line."""
+    return value.translate(_ENV_VALUE_LINE_BREAKS)
+
+
+def split_env_lines(text: str) -> list[str]:
+    """``.env`` text as lines, ``str.splitlines()``-shaped (no trailing empty line) but split only
+    where dotenv splits. Every reader or rewriter of a ``.env`` file splits through here."""
+    lines = _ENV_LINE_RE.split(text)
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def _parse_env_text(text: str) -> Dict[str, str]:
     """Tokenize already-read ``.env`` text. See :func:`load_env_file`."""
     secrets: Dict[str, str] = {}
-    for raw_line in _ENV_LINE_RE.split(text):
+    for raw_line in split_env_lines(text):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue

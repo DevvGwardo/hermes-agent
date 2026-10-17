@@ -145,6 +145,32 @@ def test_update_rotates_config_yaml_model_mirror(hermes_home):
 
 
 
+def test_update_mirror_gets_the_value_that_lands_in_env(hermes_home):
+    """The config.yaml mirror is rotated to the sanitised value .env holds, not the raw input."""
+    from hermes_cli.config import load_env
+    from hermes_cli.credential_lifecycle import save_provider_env_credential
+
+    old = "sk-oe-" + "h" * 24
+    new = "sk-oe-" + "i" * 24
+    _write_env(hermes_home, OPENAI_API_KEY=old)
+    _write_config(
+        hermes_home,
+        "model:\n"
+        "  provider: custom\n"
+        "  default: my-model\n"
+        "  base_url: https://llm.example.test/v1\n"
+        f"  api_key: {old}\n",
+    )
+
+    result = save_provider_env_credential("OPENAI_API_KEY", f"{new[:10]}\x1c{new[10:]}\n")
+
+    assert "model.api_key" in result["config_updates"]
+    cfg_text = hermes_home.joinpath("config.yaml").read_text(encoding="utf-8")
+    assert f"api_key: {new}\n" in cfg_text
+    assert "\x1c" not in cfg_text and "\\x1C" not in cfg_text.upper()
+    assert load_env()["OPENAI_API_KEY"] == new
+
+
 # ---------------------------------------------------------------------------
 # Desktop PUT /api/env — #96058: credential_pool must be materialized so the
 # live runtime picks up the new key without waiting for its next background

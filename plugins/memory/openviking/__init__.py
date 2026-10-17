@@ -812,7 +812,9 @@ def _write_env_vars(env_path: Path, env_writes: dict, remove_keys: tuple[str, ..
     # utf-8-sig + surrogateescape: a Windows editor may leave a BOM (breaks the
     # first key match) or save cp1252; round-trip undecodable bytes unchanged so
     # updating one credential cannot corrupt an unrelated value.
-    existing_lines = env_path.read_text(encoding="utf-8-sig", errors="surrogateescape").splitlines() if env_path.exists() else []
+    from agent.secret_scope import split_env_lines
+
+    existing_lines = split_env_lines(env_path.read_text(encoding="utf-8-sig", errors="surrogateescape")) if env_path.exists() else []
     updated_keys = set()
     new_lines = []
     for line in existing_lines:
