@@ -313,10 +313,16 @@ def _decode_env_bytes(raw: bytes) -> str:
         return raw.decode("latin-1")
 
 
+# Universal newlines, as ``open()`` and python-dotenv split: ``str.splitlines()`` also breaks on
+# \v, \f, \x1c-\x1e, U+0085, U+2028 and U+2029, which would read a key hidden inside a value that
+# ``os.environ`` holds as one line.
+_ENV_LINE_RE = re.compile(r"\r\n|\r|\n")
+
+
 def _parse_env_text(text: str) -> Dict[str, str]:
     """Tokenize already-read ``.env`` text. See :func:`load_env_file`."""
     secrets: Dict[str, str] = {}
-    for raw_line in text.splitlines():
+    for raw_line in _ENV_LINE_RE.split(text):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue

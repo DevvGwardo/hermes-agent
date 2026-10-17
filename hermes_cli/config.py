@@ -2586,6 +2586,16 @@ def _write_env_lines(env_path: Path, lines: list, *, preserve_mode: bool) -> Non
         _secure_file(env_path)
 
 
+# Every boundary ``str.splitlines()`` breaks on, not only CR/LF: a value carrying \x1c or U+2028 is
+# one line to dotenv but two to a splitlines() reader, so a second ``KEY=`` could hide inside it.
+_ENV_VALUE_LINE_BREAKS = str.maketrans("", "", "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
+
+def _strip_env_line_breaks(value: str) -> str:
+    """Drop every line boundary from a value bound for a single ``.env`` line."""
+    return value.translate(_ENV_VALUE_LINE_BREAKS)
+
+
 def _check_non_ascii_credential(key: str, value: str) -> str:
     """Strip non-ASCII characters from a credential (HTTP header values must be ASCII) and warn.
     Lookalike glyphs typically come from copy-pasting out of a PDF or rich-text editor."""
@@ -2711,7 +2721,7 @@ def save_env_value(key: str, value: str):
     if _env_write_blocked(key, "set"):
         return
     validate_env_var_name_for_write(key)
-    value = value.replace("\n", "").replace("\r", "")
+    value = _strip_env_line_breaks(value)
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
     env_path = get_env_path()
