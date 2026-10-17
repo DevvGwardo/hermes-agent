@@ -58,3 +58,13 @@ def test_dump_leaves_unset_key_untouched(monkeypatch, capsys, tmp_path):
     line = _api_key_line(capsys.readouterr().out, "keenable")
     assert "not set" in line
     assert "shell only" not in line
+
+
+def test_dotenv_key_names_split_lines_like_dotenv(monkeypatch, tmp_path):
+    """``\x1c`` inside a value is not a line break, so it can't name a phantom key."""
+    from hermes_cli import dump
+
+    env = tmp_path / ".env"
+    env.write_text("NOTE=a\x1cGITHUB_TOKEN=gh_evil\n", encoding="utf-8")
+    monkeypatch.setattr(dump, "get_env_path", lambda: env)
+    assert dump._dotenv_key_names() == {"NOTE"}

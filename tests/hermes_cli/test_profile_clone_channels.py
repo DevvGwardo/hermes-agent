@@ -122,6 +122,16 @@ def test_strip_env_file_keeps_comments_and_unknown_keys_verbatim(tmp_path):
     assert env.read_text(encoding="utf-8") == "# header\nexport OPENAI_API_KEY=abc\n\nMY_CUSTOM_THING=1\n"
 
 
+def test_channel_reads_split_lines_like_dotenv(home):
+    """``\\x1c`` inside a value is not a line break: no phantom channel key is reported or stripped."""
+    (home / "config.yaml").unlink()
+    env = home / ".env"
+    env.write_text("MY_NOTE=a\x1cTELEGRAM_BOT_TOKEN=1:x\n", encoding="utf-8")
+    assert "telegram" not in channel_platforms_configured(home)
+    assert strip_channel_env_file(env) == {}
+    assert env.read_text(encoding="utf-8") == "MY_NOTE=a\x1cTELEGRAM_BOT_TOKEN=1:x\n"
+
+
 # --- post-merge review of #109502 (gaoanze888): clone safety + ownership-based inventory ---------
 
 

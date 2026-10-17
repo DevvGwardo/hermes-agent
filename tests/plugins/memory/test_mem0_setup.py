@@ -154,6 +154,17 @@ class TestWriteEnv:
         assert "OPENAI_API_KEY=new" in content
 
 
+    def test_one_value_one_line(self, tmp_path):
+        """A line break inside a value is dropped, not written as a second ``KEY=``, and an existing
+        line carrying \\x1c is copied through whole, not split into two lines."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("NOTE=a\x1cGITHUB_TOKEN=gh_evil\n", encoding="utf-8")
+        _write_env(env_path, {"OPENAI_API_KEY": "sk\x1cEVIL=1\u2028X=2\nY=3"})
+        assert env_path.read_text(encoding="utf-8").split("\n") == [
+            "NOTE=a\x1cGITHUB_TOKEN=gh_evil", "OPENAI_API_KEY=skEVIL=1X=2Y=3", "",
+        ]
+
+
 class TestPromptApiKey:
 
     def test_existing_key_found_behind_bom(self, tmp_path, monkeypatch):

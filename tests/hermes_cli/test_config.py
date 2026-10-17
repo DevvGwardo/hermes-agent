@@ -459,6 +459,24 @@ class TestSaveEnvValueSecure:
             assert load_env()["ANTHROPIC_TOKEN"] == token
 
 
+    @pytest.mark.parametrize("sep", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"])
+    def test_save_env_value_drops_every_splitlines_boundary(self, tmp_path, sep):
+        """CR/LF were the only boundaries stripped, so a value carrying \\x1c (or U+2028) reached
+        disk as one dotenv line that a ``str.splitlines()`` reader split into a second ``KEY=``."""
+        from dotenv import dotenv_values
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            os.environ.pop("HASS_URL", None)
+            os.environ.pop("GITHUB_TOKEN", None)
+            save_env_value("HASS_URL", f"ok{sep}GITHUB_TOKEN=gh_evil #")
+
+            content = (tmp_path / ".env").read_text(encoding="utf-8")
+            assert sep not in content
+            assert len(content.splitlines()) == 1
+            parsed = dotenv_values(str(tmp_path / ".env"))
+            assert set(parsed) == {"HASS_URL"}
+            assert set(load_env()) == {"HASS_URL"}
+
     def test_save_env_value_already_quoted_input_is_not_double_wrapped_idempotently(
         self, tmp_path
     ):

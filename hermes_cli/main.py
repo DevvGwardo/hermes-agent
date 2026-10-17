@@ -1035,8 +1035,10 @@ def _dotenv_has_provider_key(env_file: Path, provider_env_vars: set) -> bool:
     """True if ~/.hermes/.env assigns a non-empty value to any provider key."""
     if not env_file.exists():
         return False
+    from agent.secret_scope import split_env_lines
+
     try:
-        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+        for line in split_env_lines(env_file.read_text(encoding="utf-8-sig")):
             line = line.strip()
             if line.startswith("#") or "=" not in line:
                 continue

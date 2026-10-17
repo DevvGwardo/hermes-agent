@@ -176,12 +176,14 @@ def save_provider_env_credential(env_var: str, value: str) -> Dict[str, Any]:
     kept 401'ing until the user ran ``hermes auth add <provider> --type api-key`` separately. This makes the
     Desktop save's effect on disk match what ``hermes auth add`` does.
     """
-    from hermes_cli.config import load_env, require_env_writable, save_env_value
+    from hermes_cli.config import _env_value_for_write, load_env, require_env_writable, save_env_value
 
     # A locked key must fail here: save_env_value's refusal returns like a success, and the mirror
     # scrub below would still move the new value into config.yaml.
     require_env_writable(env_var, "set")
     old_value = load_env().get(env_var)
+    # The config.yaml mirrors get exactly what lands in .env, not the raw input.
+    value = _env_value_for_write(env_var, value)
     save_env_value(env_var, value)
 
     config_updates: List[str] = []

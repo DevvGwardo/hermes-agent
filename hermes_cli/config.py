@@ -2607,6 +2607,13 @@ def _check_non_ascii_credential(key: str, value: str) -> str:
     return sanitized
 
 
+def _env_value_for_write(key: str, value: str) -> str:
+    """The exact value ``save_env_value`` puts on disk for ``key`` (line breaks and non-ASCII gone)."""
+    from agent.secret_scope import strip_env_line_breaks
+
+    return _check_non_ascii_credential(key, strip_env_line_breaks(value))
+
+
 def _quote_env_value(value: str) -> str:
     """Quote .env values containing characters with special dotenv meaning. Any whitespace
     (including internal runs) is quoted so ``set -a; . file`` word-splitting keeps paths intact."""
@@ -2711,8 +2718,7 @@ def save_env_value(key: str, value: str):
     if _env_write_blocked(key, "set"):
         return
     validate_env_var_name_for_write(key)
-    value = value.replace("\n", "").replace("\r", "")
-    value = _check_non_ascii_credential(key, value)
+    value = _env_value_for_write(key, value)
     ensure_hermes_home()
     env_path = get_env_path()
 

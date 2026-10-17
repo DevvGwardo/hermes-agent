@@ -28,7 +28,9 @@ def _dotenv_key_names() -> set[str]:
     except (OSError, UnicodeError):
         return set()
     names: set[str] = set()
-    for raw in text.splitlines():
+    from agent.secret_scope import split_env_lines
+
+    for raw in split_env_lines(text):
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
