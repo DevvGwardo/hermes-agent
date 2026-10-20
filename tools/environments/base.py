@@ -7,6 +7,7 @@ or a temp file (local). Cohesive pieces live in sibling modules (``base_output``
 ``base_session_env``, ``base_wait``, ``path_utils``).
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -472,6 +473,11 @@ class BaseEnvironment(ABC):
         """
         if output is None:
             output = _new_output_collector(proc, bounded_capture)
+        # A backend's _kill_process may need to know whether the wrapper already finished (ssh.py):
+        # the collector records its closing CWD marker as it streams past.
+        with contextlib.suppress(AttributeError):
+            output.watch_cwd_marker(self._cwd_marker)
+            proc._hermes_wait_output = output
         drain_stop = threading.Event() if yield_handler is not None else None
         drain_thread = _start_drain_thread(proc, output, drain_stop)
         _now = time.monotonic()
