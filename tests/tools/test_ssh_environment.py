@@ -341,3 +341,265 @@ class TestPersistentSSH:
         assert len(lines) == 1000
         assert lines[0] == "1"
         assert lines[-1] == "1000"
+
+
+class TestRemoteKillOnTimeout:
+    """A timed-out or interrupted command must stop on the remote host, not only the local ssh
+    client: with no pty sshd does not signal it, so a silent loop ran on for good."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_connection(self, monkeypatch):
+        monkeypatch.setattr("tools.environments.ssh.subprocess.run",
+                            lambda *a, **k: subprocess.CompletedProcess([], 0))
+        monkeypatch.setattr("tools.environments.base.time.sleep", lambda _: None)
+        self.helpers = []
+        monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
+                            lambda cmd, **k: self.helpers.append((cmd, k)) or MagicMock())
+
+    def _spawn(self, monkeypatch, env, cmd="sleep 600"):
+        captured = {}
+
+        def _fake_popen(cmd, stdin_data=None, **kwargs):
+            captured["cmd"] = cmd
+            return MagicMock()
+
+        monkeypatch.setattr(ssh_env, "_popen_bash", _fake_popen)
+        proc = env._run_bash(cmd)
+        return proc, captured["cmd"]
+
+    def test_every_command_carries_a_unique_token_in_its_remote_argv(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        p1, cmd1 = self._spawn(monkeypatch, env)
+        p2, _ = self._spawn(monkeypatch, env)
+        assert p1._hermes_remote_token.startswith("hermes-call-")
+        assert p1._hermes_remote_token != p2._hermes_remote_token
+        assert f": {p1._hermes_remote_token}; " in cmd1[-1]
+        assert cmd1[-1].endswith("sleep 600'")
+
+    def test_kill_hands_the_remote_kill_to_one_bounded_detached_helper(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        self.helpers.clear()
+        env._kill_process(proc)
+        env._kill_process(proc)  # the base backstop may call it again: one remote kill only
+        assert proc.kill.call_count == 2
+        (cmd, kwargs), = self.helpers
+        # A python helper that runs ssh under a wall clock, in its own session (survives a hard exit).
+        assert cmd[:2] == [ssh_env.sys.executable, "-c"] and "timeout=" in cmd[2]
+        assert cmd[3] == str(ssh_env._REMOTE_KILL_TIMEOUT_S) and cmd[4] == "ssh"
+        assert kwargs.get("start_new_session") is True
+        assert cmd[-4:-1] == ["u@h", "bash", "-c"]
+        token = proc._hermes_remote_token
+        remote = cmd[-1]
+        assert token not in remote  # matches the token, not the kill script's own argv
+        assert f"[h]{token[1:]}" in remote
+        assert "!= 0 ] || exit 0" in remote  # no caller-group exemption on another host
+        assert "kill -TERM" in remote and "kill -KILL" in remote
+
+    def _with_output(self, env, proc, *chunks, max_chars=10_000):
+        from tools.environments.base_output import _BoundedOutputCollector
+
+        out = _BoundedOutputCollector(max_chars)
+        out.watch_cwd_marker(env._cwd_marker)
+        for c in chunks:
+            out.append(c)
+        proc._hermes_wait_output = out
+        return out
+
+    def test_the_marker_counts_even_when_truncation_drops_it(self, monkeypatch):
+        """60K chars before the wrapper finished and 60K after (a background job still writing):
+        the bounded window loses the marker line, the streamed watch does not."""
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        m = env._cwd_marker
+        out = self._with_output(env, proc, "x" * 60_000, f"\n{m}/opt/data/workspace{m}\n", "y" * 60_000, max_chars=20_000)
+        assert m not in out.render()
+        self.helpers.clear()
+        env._kill_process(proc)
+        assert self.helpers == []
+
+    def test_an_echo_of_the_wrappers_argv_is_not_the_marker(self, monkeypatch):
+        """``ps -o args=`` of the wrapper prints the printf format: literal \\n and %s, no path."""
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        m = env._cwd_marker
+        self._with_output(env, proc, f"bash -c ... printf '\\n{m}%s{m}\\n' \"$(pwd -P)\"\n")
+        self.helpers.clear()
+        env._kill_process(proc)
+        assert len(self.helpers) == 1
+
+    def test_a_marker_split_across_chunks_is_seen(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        m = env._cwd_marker
+        line = f"\n{m}/opt/data/workspace{m}\n"
+        self._with_output(env, proc, "out" + line[:7], line[7:20], line[20:])
+        self.helpers.clear()
+        env._kill_process(proc)
+        assert self.helpers == []
+
+    def test_a_finished_wrapper_only_kills_the_client(self, monkeypatch):
+        """The wrapper printed its closing CWD marker: what holds the channel is a job it left in
+        the background (``cmd &``, the process registry's ``( nohup … ) &``), which must survive."""
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        self._with_output(env, proc, f"12345\n{env._cwd_marker}/opt/data/workspace{env._cwd_marker}\n")
+        self.helpers.clear()
+        env._kill_process(proc)
+        assert self.helpers == []
+        proc.kill.assert_called_once()
+
+    def test_a_still_running_wrapper_is_killed_remotely(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        self._with_output(env, proc, "still waiting...\n")
+        self.helpers.clear()
+        env._kill_process(proc)
+        assert len(self.helpers) == 1
+
+    def test_the_kill_is_marked_only_once_a_helper_exists(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+
+        def _boom(*a, **k):
+            raise OSError("fork failed")
+
+        monkeypatch.setattr("tools.environments.ssh.subprocess.Popen", _boom)
+        env._kill_process(proc)
+        assert getattr(proc, "_hermes_remote_kill_started", None) is not True
+        monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
+                            lambda cmd, **k: self.helpers.append((cmd, k)) or MagicMock())
+        self.helpers.clear()
+        env._force_kill_process(proc)  # the hard-exit path still gets its helper
+        assert len(self.helpers) == 1
+
+    def test_the_helper_is_reaped(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        reaped = []
+        monkeypatch.setattr(ssh_env, "_reap_in_background", reaped.append)
+        env._kill_process(proc)
+        assert len(reaped) == 1
+
+    def test_a_loopback_target_spares_the_callers_group(self, monkeypatch):
+        env = SSHEnvironment(host="127.0.0.1", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        self.helpers.clear()
+        env._kill_process(proc)
+        assert f"!= {os.getpgrp()} ] || exit 0" in self.helpers[0][0][-1]
+
+    def test_the_hard_exit_path_uses_the_same_non_blocking_kill(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        waited = []
+        monkeypatch.setattr("tools.environments.ssh.subprocess.run",
+                            lambda *a, **k: waited.append(a) or subprocess.CompletedProcess([], 0))
+        self.helpers.clear()
+        env._force_kill_process(proc)
+        # (A GC'd env from another test may run its own cleanup here: only the kill counts.)
+        assert not any("kill -TERM" in str(c) for c in waited)
+        assert len(self.helpers) == 1
+        proc.kill.assert_called_once()
+
+    def test_a_helper_that_cannot_start_still_kills_the_client(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+
+        def _boom(*a, **k):
+            raise OSError("no python")
+
+        monkeypatch.setattr("tools.environments.ssh.subprocess.Popen", _boom)
+        env._kill_process(proc)
+        proc.kill.assert_called_once()
+
+    def test_a_handle_without_a_token_only_kills_the_client(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        self.helpers.clear()
+        proc = MagicMock(spec=["kill", "poll", "wait"])
+        env._kill_process(proc)
+        proc.kill.assert_called_once()
+        assert self.helpers == []
+
+
+_POSIX_PGREP = pytest.mark.skipif(os.name == "nt" or not ssh_env.shutil.which("pgrep"), reason="needs a POSIX host with pgrep")
+
+
+def _spawn_group(argv):
+    return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def _killpg_quiet(pid):
+    try:
+        os.killpg(pid, 9)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+@_POSIX_PGREP
+@pytest.mark.parametrize("shell", ["bash", "dash", "sh"])
+def test_remote_kill_script_stops_a_silent_loop_and_its_children(shell):
+    """The real script against a real process group: the shape of the 17h incident (a loop that
+    never writes output), plus a child in the same group. Run with the shells sshd may use."""
+    import time
+
+    if not ssh_env.shutil.which(shell):
+        pytest.skip(f"{shell} not installed")
+    token = ssh_env._new_call_token()
+    victim = _spawn_group(["bash", "-c", f": {token}; sleep 300 & while true; do sleep 1; done"])
+    try:
+        time.sleep(0.5)
+        out = subprocess.run([shell, "-c", ssh_env._remote_kill_script(token)], capture_output=True, text=True, timeout=15)
+        assert out.returncode == 0, out.stderr
+        victim.wait(timeout=5)
+        time.sleep(0.3)
+        assert not _group_alive(victim.pid)
+    finally:
+        _killpg_quiet(victim.pid)
+    # Nothing left to find: a second run is a no-op.
+    assert subprocess.run([shell, "-c", ssh_env._remote_kill_script(token)], timeout=15).returncode == 0
+
+
+@_POSIX_PGREP
+def test_remote_kill_script_spares_a_local_ssh_client_carrying_the_token(tmp_path):
+    """Loopback target (hermes-deploy's tool sandbox): the local ssh CLIENT's argv carries the token
+    as well. The kill must skip it (its comm may be a full path, as on macOS) and stop only the
+    remote command."""
+    import shutil as _sh
+    import time
+
+    token = ssh_env._new_call_token()
+    fake_ssh = tmp_path / "ssh"
+    _sh.copy(_sh.which("bash"), fake_ssh)
+    client = _spawn_group([str(fake_ssh), "-c", "sleep 300", f"bash -c ': {token}; ...'"])
+    victim = _spawn_group(["bash", "-c", f": {token}; while true; do sleep 1; done"])
+    try:
+        time.sleep(0.5)
+        assert client.pid < victim.pid  # the client is found first, as on the VM
+        subprocess.run(["bash", "-c", ssh_env._remote_kill_script(token)], timeout=15, check=True)
+        victim.wait(timeout=5)
+        assert client.poll() is None, "the local ssh client's group was killed"
+    finally:
+        _killpg_quiet(client.pid)
+        _killpg_quiet(victim.pid)
+
+
+@_POSIX_PGREP
+def test_remote_kill_script_spares_the_callers_group():
+    import time
+
+    token = ssh_env._new_call_token()
+    victim = _spawn_group(["bash", "-c", f": {token}; while true; do sleep 1; done"])
+    try:
+        time.sleep(0.5)
+        subprocess.run(["bash", "-c", ssh_env._remote_kill_script(token, spare_pgid=victim.pid)], timeout=15, check=True)
+        assert victim.poll() is None
+    finally:
+        _killpg_quiet(victim.pid)

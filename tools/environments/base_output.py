@@ -9,6 +9,7 @@ import codecs
 import os
 import select
 import subprocess
+import re
 import threading
 import time
 from collections import deque
@@ -48,6 +49,24 @@ class _BoundedOutputCollector:
         self._spill_fh: IO[str] | None = None
         self._spill_chars = 0
         self._spill_capped = False
+        # CWD-marker watch (watch_cwd_marker): scanned per chunk, so truncation can't hide it.
+        self._marker_re: "re.Pattern[str] | None" = None
+        self._marker_tail = ""
+        self._marker_seen = False
+
+    _MARKER_WINDOW = 8192  # the marker line is short; a path is under 4 KB
+
+    def watch_cwd_marker(self, marker: str) -> None:
+        """Record whether the wrapper's closing CWD marker line (``\\n<marker>/abs/path<marker>\\n``,
+        printed as its last action) ever streams past. A real newline and an absolute path are
+        required, so an echo of the wrapper's own argv (literal ``\\n`` and ``%s``) never matches."""
+        with self._lock:
+            self._marker_re = re.compile("\n" + re.escape(marker) + "/[^\n]*" + re.escape(marker) + "\r?\n")
+
+    @property
+    def cwd_marker_seen(self) -> bool:
+        with self._lock:
+            return self._marker_seen
 
     def _maybe_spill(self, text: str) -> None:
         """Tee ``text`` to the spill file (opened lazily on first overflow)."""
@@ -102,6 +121,11 @@ class _BoundedOutputCollector:
         if not text:
             return
         with self._lock:
+            if self._marker_re is not None and not self._marker_seen:
+                scan = self._marker_tail + text
+                if self._marker_re.search(scan):
+                    self._marker_seen = True
+                self._marker_tail = scan[-self._MARKER_WINDOW:]
             text_len = len(text)
             # Spill tee activates at the first overflow, then mirrors every chunk.
             if self._spill_path is not None and (

@@ -4,15 +4,18 @@ import contextlib
 import hashlib
 import logging
 import os
+import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Iterable
 
 from tools.environments.base import BaseEnvironment, EnvironmentConnectionError
-from tools.environments.base_output import _popen_bash
+from tools.environments.base_output import _BoundedOutputCollector, _popen_bash
 from tools.environments.file_sync import (
     FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command, unique_parent_dirs)
 from tools.environments.remote_common import (
@@ -27,6 +30,63 @@ _SSH_MULTIPLEX = os.name != "nt"
 
 # Module-level binding: tests patch ``ssh._load_hermes_env_vars`` to fake the .env file.
 _load_hermes_env_vars = load_hermes_env_vars
+
+# Killing the local ``ssh`` client on a timeout or interrupt does not stop the remote command:
+# with no pty, sshd sends it no signal when the channel closes, and a command that never writes
+# output never gets SIGPIPE, so it ran on for good (a wait loop survived 17h). Each command now
+# carries a random token in its remote argv; the kill finds it from a second session and signals
+# its whole process group, the same group kill the local backend does.
+_CALL_TOKEN_PREFIX = "hermes-call-"
+_REMOTE_KILL_TIMEOUT_S = 10
+
+# Runs one ssh command bounded by a wall clock and reaps it, detached from the host process: the
+# kill returns at once, survives a hard exit, and a wedged connection cannot keep it alive.
+_BOUNDED_RUN = (
+    "import subprocess, sys\n"
+    "try:\n"
+    "    subprocess.run(sys.argv[2:], timeout=float(sys.argv[1]), stdin=subprocess.DEVNULL,\n"
+    "                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+
+
+def _reap_in_background(proc: subprocess.Popen) -> None:
+    """Wait for *proc* on a daemon thread so an idle host keeps no zombie (a hard exit just
+    leaves the helper to init)."""
+    threading.Thread(target=proc.wait, name="ssh-remote-kill-reaper", daemon=True).start()
+
+
+def _new_call_token() -> str:
+    return _CALL_TOKEN_PREFIX + secrets.token_hex(8)
+
+
+def _remote_kill_script(token: str, spare_pgid: int | None = None) -> str:
+    """POSIX shell that TERMs the process group of the command carrying *token*, waits up to 2s,
+    then KILLs it. Exits 0 on every path; a host without pgrep/ps is left as before. Only used
+    while the call's wrapper is still running (see SSHEnvironment._kill_process).
+
+    - The pattern is ``[h]ermes-call-…``: it matches the token but not this script's own argv.
+    - Only the login user's processes, and never an ``ssh`` client (``comm`` may be a full path):
+      on a loopback target the local CLIENT's argv carries the token too.
+    - The group of the topmost token holder (its parent has no token): the wrapper, or the shell
+      or ForceCommand sandbox that runs it.
+    - Never this script's own group, nor *spare_pgid* (the caller's, on a loopback target)."""
+    pattern = shlex.quote(f"[{token[0]}]{token[1:]}")
+    spare = str(int(spare_pgid)) if spare_pgid else "0"
+    return (
+        f"pids=\" $(pgrep -u \"$(id -u)\" -f {pattern} | tr '\\n' ' ') \"; "
+        "me=$(ps -o pgid= -p $$ | tr -d ' '); g=; "
+        "for p in $pids; do "
+        "c=$(ps -o comm= -p \"$p\"); [ \"${c##*/}\" = ssh ] && continue; "
+        "pp=$(ps -o ppid= -p \"$p\" | tr -d ' '); "
+        "case \"$pids\" in *\" $pp \"*) continue;; esac; "
+        "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); break; done; "
+        f"[ -n \"$g\" ] && [ \"$g\" -gt 1 ] && [ \"$g\" != \"$me\" ] && [ \"$g\" != {spare} ] || exit 0; "
+        "kill -TERM \"-$g\" 2>/dev/null; "
+        "for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 \"-$g\" 2>/dev/null || exit 0; sleep 0.2; done; "
+        "kill -KILL \"-$g\" 2>/dev/null; exit 0"
+    )
 
 
 def _ensure_ssh_available() -> None:
@@ -281,9 +341,55 @@ class SSHEnvironment(BaseEnvironment):
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
         scope are unset remotely so a shared host cannot serve another profile's value."""
         values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
-        cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
+        token = _new_call_token()  # lets _kill_process find the remote command (see _remote_kill_script)
+        remote = f": {token}; {prepend_unset(cmd_string, unset_names)}"
+        cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(remote), login)
         client_env = client_env_with(values)
-        return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
+        proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
+        proc._hermes_remote_token = token
+        return proc
+
+    def _wrapper_finished(self, proc) -> bool:
+        """True when the call's wrapper already printed its closing CWD marker line (its last action;
+        matched as it streamed, see _BoundedOutputCollector.watch_cwd_marker):
+        what still holds the channel open is then a job it left in the background (``cmd &``, the
+        process registry's ``( nohup … ) &``), which must survive the call as on the local backend."""
+        out = getattr(proc, "_hermes_wait_output", None)
+        return isinstance(out, _BoundedOutputCollector) and out.cwd_marker_seen
+
+    def _kill_remote(self, proc) -> None:
+        """Stop the remote side of *proc* (see _remote_kill_script) without blocking the caller:
+        a detached helper runs the kill under a wall clock (_REMOTE_KILL_TIMEOUT_S), so it finishes
+        even when this process exits next (hard exit), and a daemon thread reaps it. Once per
+        process. Never raises."""
+        token = getattr(proc, "_hermes_remote_token", None)
+        if not isinstance(token, str) or getattr(proc, "_hermes_remote_kill_started", False) is True:
+            return
+        if self._wrapper_finished(proc):
+            return
+        # The caller's own group can only be hit on this machine (a loopback target, e.g. a tool
+        # sandbox); elsewhere the same number names an unrelated remote group.
+        spare = None
+        if self.host in ("127.0.0.1", "::1", "localhost") and hasattr(os, "getpgrp"):
+            spare = os.getpgrp()
+        # Explicit bash: the login shell may be csh or fish.
+        cmd = self._build_ssh_command() + bash_argv(shlex.quote(_remote_kill_script(token, spare)))
+        try:
+            helper = subprocess.Popen([sys.executable, "-c", _BOUNDED_RUN, str(_REMOTE_KILL_TIMEOUT_S), *cmd],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, start_new_session=True)
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("SSH: could not start the remote kill of %s", token, exc_info=True)
+            return
+        # Marked only once a helper exists, so a hard exit racing an ordinary kill still starts one.
+        with contextlib.suppress(AttributeError):
+            proc._hermes_remote_kill_started = True
+        _reap_in_background(helper)
+
+    def _kill_process(self, proc):
+        # Non-blocking, so the base _force_kill_process (hard exit) can use it as is.
+        self._kill_remote(proc)
+        super()._kill_process(proc)
 
     def cleanup(self):
         if self._sync_manager:
