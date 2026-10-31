@@ -5,6 +5,7 @@ Covers the GitHub mapping, the store (dedup, one item per thread, cap, 0600), th
 403 disable, rate limit, backoff, token rotation).
 """
 
+import json
 import os
 import stat
 import threading
@@ -101,6 +102,20 @@ def test_new_activity_on_a_thread_keeps_one_id_and_goes_unread_again():
     assert bus.add_notifications([first]) == 0
     (only,) = bus.list_notifications()
     assert only["at"] == "2026-10-07T13:00:00Z"
+
+
+def test_legacy_per_update_ids_are_dropped_on_read():
+    """The upgrade clears its own noise: 229 per-update rows are not something a
+    user should have to dismiss by hand."""
+    path = bus._inbox_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "items": [
+        {"id": "github:1001:2026-10-07T12:00:00Z", "thread": "github:1001", "source": "github",
+         "kind": "pr", "title": "old shape", "at": "2026-10-07T12:00:00Z", "read": False},
+        {"id": "github:1002", "thread": "github:1002", "source": "github", "kind": "pr",
+         "title": "new shape", "at": "2026-10-07T13:00:00Z", "read": False},
+    ]}), encoding="utf-8")
+    assert [i["id"] for i in bus.list_notifications()] == ["github:1002"]
 
 
 def test_legacy_per_update_ids_are_replaced_by_the_thread_id():

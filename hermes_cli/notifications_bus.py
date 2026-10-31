@@ -150,6 +150,18 @@ def _save(items: List[Dict[str, Any]]) -> None:
     atomic_json_write(path, {"version": 1, "items": items}, mode=0o600)
 
 
+# Pre-fix ids carried the thread update time (``github:<thread>:<at>``), which
+# is what let one thread become N unread items. They are not repairable in place
+# (the thread id is inside them, but their read state is meaningless now), so
+# they are dropped on read: the upgrade clears its own noise instead of leaving
+# the user to dismiss 229 rows by hand.
+_LEGACY_ID = re.compile(r"^github:\d+:\d{4}-\d{2}-\d{2}T")
+
+
+def _without_legacy_ids(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [i for i in items if not (isinstance(i.get("id"), str) and _LEGACY_ID.match(i["id"]))]
+
+
 def _capped(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(items, key=_sort_key, reverse=True)[:MAX_ITEMS]
 
@@ -199,7 +211,7 @@ def add_notifications(new_items: Iterable[Dict[str, Any]]) -> int:
 def list_notifications(since: Optional[datetime] = None, limit: int = 200) -> List[Dict[str, Any]]:
     """Newest first; ``since`` keeps items strictly newer than it."""
     with _STORE_LOCK:
-        items = _load()
+        items = _without_legacy_ids(_load())
     out = []
     for item in sorted(items, key=_sort_key, reverse=True):
         if since is not None and _sort_key(item) <= since:
