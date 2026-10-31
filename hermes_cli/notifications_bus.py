@@ -50,6 +50,36 @@ FIRST_POLL_DELAY_S = 15.0
 # (items dedup by id, so re-seeing one is harmless).
 SINCE_OVERLAP_S = 60.0
 
+# Relevance. GitHub tells us WHY a thread was delivered, and three reasons mean
+# "activity in a repo you watch", not "someone needs you": your own pulls
+# (``author``), their merges/closes (``state_change``) and bare subscription
+# traffic (``subscribed``). On a live account those were 48 of 50 unread threads —
+# the account's own PRs, arriving as notifications about work it just did.
+DEFAULT_SKIP_REASONS = frozenset({"author", "state_change", "subscribed"})
+REASONS_ENV = "HERMES_NOTIFICATIONS_GITHUB_REASONS"
+
+
+def relevant_reasons() -> Optional[frozenset[str]]:
+    """Which GitHub reasons may reach the inbox.
+
+    ``None`` is the default policy (skip ``DEFAULT_SKIP_REASONS``). A set is an
+    allowlist: only those reasons are kept. ``all`` / ``*`` keeps everything,
+    which is what a user who wants their own PRs back would set.
+    """
+    raw = os.environ.get(REASONS_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw in {"all", "*"}:
+        return frozenset()
+    return frozenset(r.strip() for r in raw.split(",") if r.strip())
+
+
+def reason_relevant(reason: Any, allow: Optional[frozenset[str]]) -> bool:
+    value = reason.strip().lower() if isinstance(reason, str) else ""
+    if allow is None:
+        return value not in DEFAULT_SKIP_REASONS
+    return not allow or value in allow
+
 _KIND_BY_SUBJECT = {
     "PullRequest": "pr",
     "Issue": "issue",
@@ -138,13 +168,22 @@ def add_notifications(new_items: Iterable[Dict[str, Any]]) -> int:
         for item in incoming:
             prev = by_id.get(item["id"])
             if prev is not None:
-                by_id[item["id"]] = {**item, "read": bool(prev.get("read")) or bool(item.get("read"))}
+                if _sort_key(item) < _sort_key(prev):
+                    continue  # an older snapshot never rewrites a newer thread
+                # Read survives only while the thread has not moved on. New
+                # activity (a newer ``at``) that GitHub still reports unread must
+                # go back to unread, or a stable id would silence the thread
+                # forever after the first read.
+                moved_on = _sort_key(item) > _sort_key(prev)
+                read = bool(item.get("read")) or (bool(prev.get("read")) and not moved_on)
+                by_id[item["id"]] = {**item, "read": read}
                 continue
             thread = item.get("thread")
             if thread:
+                # Older copies of the same thread (legacy ``github:<id>:<at>``
+                # ids included) are superseded by this one.
                 for old_id in [k for k, v in by_id.items() if v.get("thread") == thread]:
-                    old = by_id[old_id]
-                    if _sort_key(old) > _sort_key(item):
+                    if _sort_key(by_id[old_id]) > _sort_key(item):
                         break
                     del by_id[old_id]
                 else:
@@ -189,7 +228,7 @@ def mark_read(ids: Iterable[str]) -> int:
 
 def public_item(item: Mapping[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"id": item["id"], "title": item["title"], "read": bool(item.get("read"))}
-    for key in ("source", "kind", "url", "repo", "at"):
+    for key in ("source", "kind", "reason", "url", "repo", "at"):
         value = item.get(key)
         if isinstance(value, str) and value:
             out[key] = value
@@ -231,8 +270,13 @@ def map_github_notification(raw: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     at = _iso(updated)
     repo_name = repository.get("full_name") if isinstance(repository.get("full_name"), str) else None
     repo_html = repository.get("html_url") if isinstance(repository.get("html_url"), str) else None
+    reason = raw.get("reason") if isinstance(raw.get("reason"), str) else ""
     item: Dict[str, Any] = {
-        "id": f"github:{thread}:{at}",
+        # One id per THREAD, not per update. A per-update id minted a new unread
+        # item on every push/comment/CI run (229 items for ~30 threads on a live
+        # account) and made "read" impossible to keep: the app had never seen the
+        # new id. Unread now comes from ``at`` moving forward instead.
+        "id": f"github:{thread}",
         "thread": f"github:{thread}",
         "source": "github",
         "kind": kind,
@@ -240,6 +284,8 @@ def map_github_notification(raw: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         "at": at,
         "read": raw.get("unread") is False,
     }
+    if reason:
+        item["reason"] = reason
     if repo_name and len(repo_name) <= 140:
         item["repo"] = repo_name
     url = github_html_url(subject.get("url"), repo_html, kind)
@@ -365,8 +411,12 @@ class GitHubPoller:
             self._last_modified = res.headers.get("last-modified") or self._last_modified
             self._since = started
             items = [i for i in (map_github_notification(r) for r in res.body if isinstance(r, dict)) if i]
-            if items:
-                add_notifications(items)
+            allow = relevant_reasons()
+            kept = [i for i in items if reason_relevant(i.get("reason"), allow)]
+            if len(kept) != len(items):
+                _log.debug("GitHub notifications: %d of %d skipped by reason", len(items) - len(kept), len(items))
+            if kept:
+                add_notifications(kept)
             return self._interval
         if res.status == 403 and res.headers.get("x-ratelimit-remaining") == "0":
             try:
