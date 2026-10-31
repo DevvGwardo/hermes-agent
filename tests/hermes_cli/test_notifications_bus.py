@@ -5,6 +5,7 @@ Covers the GitHub mapping, the store (dedup, one item per thread, cap, 0600), th
 403 disable, rate limit, backoff, token rotation).
 """
 
+import json
 import os
 import stat
 import threading
@@ -20,14 +21,17 @@ from starlette.testclient import TestClient
 
 
 def _gh(thread="1001", stype="PullRequest", title="Add the bell", updated="2026-10-07T12:00:00Z",
-        url="https://api.github.com/repos/Maia-VM/hermes-deploy/pulls/236", unread=True):
-    return {
+        url="https://api.github.com/repos/Maia-VM/hermes-deploy/pulls/236", unread=True, reason=None):
+    raw = {
         "id": thread,
         "unread": unread,
         "updated_at": updated,
         "subject": {"title": title, "url": url, "type": stype},
         "repository": {"full_name": "Maia-VM/hermes-deploy", "html_url": "https://github.com/Maia-VM/hermes-deploy"},
     }
+    if reason is not None:
+        raw["reason"] = reason
+    return raw
 
 
 # -- mapping -------------------------------------------------------------------
@@ -35,7 +39,7 @@ def _gh(thread="1001", stype="PullRequest", title="Add the bell", updated="2026-
 def test_maps_pull_request_issue_and_ci():
     pr = bus.map_github_notification(_gh())
     assert pr == {
-        "id": "github:1001:2026-10-07T12:00:00Z",
+        "id": "github:1001",
         "thread": "github:1001",
         "source": "github",
         "kind": "pr",
@@ -79,18 +83,54 @@ def test_store_dedups_by_id_and_keeps_read_state():
     assert "thread" not in only
 
 
-def test_new_activity_on_a_thread_replaces_it_under_a_new_unread_id():
+def test_new_activity_on_a_thread_keeps_one_id_and_goes_unread_again():
+    """One id per thread. A per-update id minted a new unread item on every
+    push/comment/CI run (229 items for ~30 threads on a live account) and made
+    read impossible to keep: the app had never seen the new id."""
     first = bus.map_github_notification(_gh(updated="2026-10-07T12:00:00Z"))
+    assert first["id"] == "github:1001"
     bus.add_notifications([first])
     bus.mark_read([first["id"]])
-    later = bus.map_github_notification(_gh(updated="2026-10-07T13:00:00Z"))
-    assert bus.add_notifications([later]) == 1
-    items = bus.list_notifications()
-    assert [i["id"] for i in items] == [later["id"]]
-    assert items[0]["read"] is False
+    later = bus.map_github_notification(_gh(updated="2026-10-07T13:00:00Z", unread=True))
+    assert later["id"] == first["id"]
+    assert bus.add_notifications([later]) == 0  # same thread, not a new item
+    (only,) = bus.list_notifications()
+    assert only["id"] == "github:1001"
+    assert only["at"] == "2026-10-07T13:00:00Z"
+    assert only["read"] is False  # moved on after it was read
     # An older copy of the same thread never replaces the newer one.
     assert bus.add_notifications([first]) == 0
-    assert [i["id"] for i in bus.list_notifications()] == [later["id"]]
+    (only,) = bus.list_notifications()
+    assert only["at"] == "2026-10-07T13:00:00Z"
+
+
+def test_legacy_per_update_ids_are_dropped_on_read():
+    """The upgrade clears its own noise: 229 per-update rows are not something a
+    user should have to dismiss by hand."""
+    path = bus._inbox_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "items": [
+        {"id": "github:1001:2026-10-07T12:00:00Z", "thread": "github:1001", "source": "github",
+         "kind": "pr", "title": "old shape", "at": "2026-10-07T12:00:00Z", "read": False},
+        {"id": "github:1002", "thread": "github:1002", "source": "github", "kind": "pr",
+         "title": "new shape", "at": "2026-10-07T13:00:00Z", "read": False},
+    ]}), encoding="utf-8")
+    assert [i["id"] for i in bus.list_notifications()] == ["github:1002"]
+
+
+def test_legacy_per_update_ids_are_replaced_by_the_thread_id():
+    bus.add_notifications([{
+        "id": "github:1001",
+        "thread": "github:1001",
+        "source": "github",
+        "kind": "pr",
+        "title": "Add the bell",
+        "at": "2026-10-07T12:00:00Z",
+        "read": True,
+    }])
+    item = bus.map_github_notification(_gh(updated="2026-10-07T12:00:00Z"))
+    bus.add_notifications([item])
+    assert [i["id"] for i in bus.list_notifications()] == ["github:1001"]
 
 
 def test_store_is_capped_newest_first_and_private():
@@ -112,6 +152,64 @@ def test_corrupt_store_reads_as_empty():
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json")
     assert bus.list_notifications() == []
+
+
+# -- relevance ----------------------------------------------------------------
+#
+# GitHub delivers "you did this yourself" as a notification: author (your own
+# PR), state_change (it merged/closed), subscribed (repo traffic). Those are
+# not things to interrupt someone for, and on a live account they were 48 of 50
+# unread threads. The policy is a skip-list by default and an allowlist when
+# HERMES_NOTIFICATIONS_GITHUB_REASONS names one.
+
+def test_default_policy_skips_own_activity_and_keeps_what_needs_you():
+    allow = bus.relevant_reasons()
+    assert allow is None
+    for skipped in ("author", "state_change", "subscribed", "AUTHOR"):
+        assert bus.reason_relevant(skipped, allow) is False
+    for kept in ("review_requested", "mention", "team_mention", "comment", "ci_activity", ""):
+        assert bus.reason_relevant(kept, allow) is True
+
+
+def test_reason_env_is_an_allowlist(monkeypatch):
+    monkeypatch.setenv(bus.REASONS_ENV, " review_requested , mention ")
+    allow = bus.relevant_reasons()
+    assert allow == frozenset({"review_requested", "mention"})
+    assert bus.reason_relevant("review_requested", allow) is True
+    assert bus.reason_relevant("author", allow) is False
+    assert bus.reason_relevant("comment", allow) is False
+
+
+def test_reason_env_all_keeps_everything(monkeypatch):
+    monkeypatch.setenv(bus.REASONS_ENV, "all")
+    allow = bus.relevant_reasons()
+    assert allow == frozenset()
+    assert bus.reason_relevant("author", allow) is True
+
+
+def test_poll_stores_only_relevant_reasons():
+    http = FakeGitHub(bus.HttpResult(200, {}, [
+        _gh(thread="1", reason="author"),
+        _gh(thread="2", reason="state_change"),
+        _gh(thread="3", reason="review_requested"),
+    ]))
+    poller, _ = _poller(http)
+    poller.poll_once()
+    assert [i["id"] for i in bus.list_notifications()] == ["github:3"]
+
+
+def test_poll_with_all_reasons_keeps_author(monkeypatch):
+    monkeypatch.setenv(bus.REASONS_ENV, "all")
+    http = FakeGitHub(bus.HttpResult(200, {}, [_gh(thread="1", reason="author")]))
+    poller, _ = _poller(http)
+    poller.poll_once()
+    assert [i["id"] for i in bus.list_notifications()] == ["github:1"]
+
+
+def test_public_item_exposes_the_reason_for_the_app():
+    item = bus.map_github_notification(_gh(reason="review_requested"))
+    assert item["reason"] == "review_requested"
+    assert bus.public_item(item)["reason"] == "review_requested"
 
 
 # -- routes --------------------------------------------------------------------
@@ -151,10 +249,10 @@ def test_get_returns_the_envelope_the_app_parses(client):
         bus.map_github_notification(_gh(thread="2", updated="2026-10-07T11:00:00Z")),
     ])
     body = client.get("/api/notifications").json()
-    assert [i["id"] for i in body["notifications"]] == ["github:2:2026-10-07T11:00:00Z", "github:1:2026-10-07T10:00:00Z"]
+    assert [i["id"] for i in body["notifications"]] == ["github:2", "github:1"]
     assert set(body["notifications"][0]) == {"id", "title", "read", "source", "kind", "url", "repo", "at"}
     newer = client.get("/api/notifications", params={"since": "2026-10-07T10:30:00Z"}).json()
-    assert [i["id"] for i in newer["notifications"]] == ["github:2:2026-10-07T11:00:00Z"]
+    assert [i["id"] for i in newer["notifications"]] == ["github:2"]
     assert client.get("/api/notifications", params={"since": "yesterday"}).status_code == 400
 
 
