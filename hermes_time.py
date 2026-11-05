@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ``identity -> (name, ZoneInfo | None)`` value, so racing resolvers can never publish a mixed
 # identity/value pair. Call reset_cache() after in-place config changes.
 _cache_lock = threading.Lock()
-_tz_cache: Dict[Tuple[str, ...], Tuple[str, Optional[ZoneInfo]]] = {}
+_tz_cache: dict[tuple[str, ...], tuple[str, Optional[ZoneInfo]]] = {}
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 # ASCII plus surrogateescape'd bytes only: the shape of native text decoded with the wrong codec.
@@ -88,7 +88,7 @@ def _config_mtime_ns(path) -> int:
         return 0
 
 
-def _timezone_cache_identity() -> Tuple[str, ...]:
+def _timezone_cache_identity() -> tuple[str, ...]:
     tz_env = _env_timezone()
     if tz_env:
         return ("environment", tz_env)
@@ -108,14 +108,15 @@ def _resolve_timezone_name() -> str:
         # Prefer the shared cached effective-config loader (mtime-keyed + libyaml, managed overlay
         # included so an administrator can pin ``timezone``): a direct safe_load of a large
         # config.yaml costs ~100 ms and this ran inside the FIRST system prompt build. The bare
-        # parse is the stdlib-safe fallback for bootstrap consumers without hermes_cli importable.
+        # parse through the config backend is the fallback when the effective loader cannot be
+        # imported (any failure there lands in the outer except: no configured timezone).
         try:
             from hermes_cli.config_effective import load_user_config_effective
             cfg = load_user_config_effective(get_config_path())
         except Exception:
-            import hermes_yaml as yaml
+            from hermes_cli.config_backend import config_exists, read_config_doc
             config_path = get_config_path()
-            cfg = (yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}) if config_path.exists() else {}
+            cfg = (read_config_doc(config_path) or {}) if config_exists(config_path) else {}
         if cfg:
             tz_cfg = cfg.get("timezone", "")
             if isinstance(tz_cfg, str) and tz_cfg.strip():
@@ -125,7 +126,7 @@ def _resolve_timezone_name() -> str:
     return ""
 
 
-def _timezone_entry() -> Tuple[str, Optional[ZoneInfo]]:
+def _timezone_entry() -> tuple[str, Optional[ZoneInfo]]:
     """Cached ``(configured name, ZoneInfo | None)`` for the active profile."""
     cache_identity = _timezone_cache_identity()
     with _cache_lock:

@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
-from tools import browser_tool_lifecycle as bt_lifecycle
+from tools import browser_session_lifecycle as bt_lifecycle
 
 def _make_runner():
     """Create a minimal GatewayRunner with just the cache infrastructure."""
@@ -98,7 +98,7 @@ class TestAgentConfigSignature:
                 },
             },
         )
-        monkeypatch.setattr(runtime_provider, "_get_model_config", lambda: {})
+        monkeypatch.setattr(runtime_provider, "_get_model_config", dict)
 
         runtime = _resolve_runtime_agent_kwargs()
 
@@ -156,7 +156,7 @@ class TestExtractCacheBustingConfig:
 
         default_cap = DEFAULT_CONFIG["compression"]["threshold_tokens"]
         other_cap = (default_cap or 0) + 100_000
-        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)["compression.threshold_tokens"]  # noqa: E731
+        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)["compression.threshold_tokens"]
         assert sig({}) == sig({"compression": {"threshold_tokens": default_cap}}) == default_cap
         assert sig({"compression": {"threshold_tokens": other_cap}}) == other_cap != sig({})
 
@@ -858,6 +858,7 @@ class TestKeyCmdCredentialKeepsTheCachedAgent:
 
     def test_turns_reuse_the_agent_and_a_replaced_agent_is_released(self):
         from types import SimpleNamespace
+        from gateway.config import Platform
 
         from gateway.run_turn_runner import TurnRunner
 
@@ -873,7 +874,9 @@ class TestKeyCmdCredentialKeepsTheCachedAgent:
         runner._refresh_fallback_model = lambda: None
         ctx = SimpleNamespace(session_key=self.SESSION_KEY, session_id="sid-1", user_config={},
                               enabled_toolsets=["hermes-telegram"], _interrupt_depth=0,
-                              source=SimpleNamespace(user_id="u1", user_id_alt=None))
+                              interim_assistant_messages_enabled=False,
+                              source=SimpleNamespace(platform=Platform.TELEGRAM, chat_id="1",
+                                                     user_id="u1", user_id_alt=None))
         turn = TurnRunner(runner, ctx)
         built = []
         turn._build_fresh_agent = lambda *a, **k: built.append(MagicMock()) or built[-1]
@@ -894,6 +897,7 @@ class TestKeyCmdCredentialKeepsTheCachedAgent:
 
     def test_an_agent_replaced_mid_turn_is_released_once_that_turn_ends(self):
         from types import SimpleNamespace
+        from gateway.config import Platform
 
         from gateway.run_turn_runner import TurnRunner
 
@@ -910,7 +914,9 @@ class TestKeyCmdCredentialKeepsTheCachedAgent:
         runner._refresh_fallback_model = lambda: None
         ctx = SimpleNamespace(session_key=self.SESSION_KEY, session_id="sid-1", user_config={},
                               enabled_toolsets=["hermes-telegram"], _interrupt_depth=0,
-                              source=SimpleNamespace(user_id="u1", user_id_alt=None))
+                              interim_assistant_messages_enabled=False,
+                              source=SimpleNamespace(platform=Platform.TELEGRAM, chat_id="1",
+                                                     user_id="u1", user_id_alt=None))
         turn = TurnRunner(runner, ctx)
         turn._MIDTURN_RELEASE_POLL_S = 0.0
         built = []
