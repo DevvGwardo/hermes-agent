@@ -22,15 +22,40 @@ GitHub opens fork PRs against the parent repo by default. When you open a PR, ch
 
 ## Keeping up with upstream
 
-Upstream moves hundreds of commits a day. The `maiavm-upstream-sync` workflow runs daily at 06:17 UTC; you can also run it by hand. Each run:
+Upstream moves thousands of commits a day. The `maiavm-upstream-sync` workflow
+runs **weekly** (Mondays, 06:17 UTC); you can also run it by hand and pass an
+explicit upstream commit. Each run:
 
 1. Mirrors upstream `main` to the `upstream` branch.
-2. If `maiavm` already contains it, stops.
-3. Otherwise merges it into `sync/upstream-YYYYMMDD`:
-   - **Clean merge:** opens a PR into `maiavm`.
-   - **Conflicts:** opens (or updates) one issue listing the conflicting files, so someone resolves them on a sync branch.
+2. Resolves one upstream commit for the run (the head of `main` at start, or the
+   `upstream_sha` you passed) and records its SHA in the PR body.
+3. If `maiavm` already contains it, stops.
+4. Otherwise merges it into the single rolling branch **`bot/upstream-sync`**:
+   - **Clean merge:** force-with-lease updates that branch and creates or
+     updates ONE open PR into `maiavm`.
+   - **Conflicts:** leaves the existing branch and PR untouched, writes the
+     conflicting files to the run summary, posts them to
+     `MAIAVM_SYNC_ALERT_WEBHOOK` if that secret is set, and fails the run.
+   - **Human commit on the branch:** skips, so a manual resolution is never
+     clobbered.
 
-Sync PRs are never auto-merged. Review them like any other change, since upstream behaviour changes reach production through them.
+`maiavm-upstream-sync.yml` is the only writer of that branch. If you need to
+resolve a conflict by hand, work on a `sync/*` branch from `maiavm`, push it and
+open a PR; the bot will keep out of the way until it merges.
+
+**Cadence.** Detection/integration candidates are weekly and deliberately not
+daily: a daily merge of a fast-moving upstream is not a reviewable unit. Release
+from a tag, never from the branch — cut `maiavm-YYYY.MM.DD` only after the
+upstream PR is merged, then canary one VM before hermes-deploy's pin moves.
+Sync PRs are never auto-merged; review them like any other change, since
+upstream behaviour changes reach production through them.
+
+**Alerts.** Set the repo secret `MAIAVM_SYNC_ALERT_WEBHOOK` (Slack, Discord, or
+a Telegram webhook bridge) so a blocked sync reaches a human. It is optional
+and only affects alerting; without it, a conflict is visible only on the run
+page. `maiavm-sync-watchdog.yml` runs daily and alerts when the sync has not
+produced a successful run in 10 days, or has not run at all in 8 — the failure
+mode that let the 2026-09-28 sync sit dead for five weeks unnoticed.
 
 **Token.** Upstream often changes `.github/workflows/*`. The default `GITHUB_TOKEN` is not allowed to push workflow changes, and PRs it opens don't trigger CI. Add a fine-grained PAT as the repo secret **`MAIAVM_SYNC_TOKEN`** with these permissions on this repo only:
 

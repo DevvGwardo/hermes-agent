@@ -1,18 +1,37 @@
 name: maiavm upstream sync
 
 # Fork-only (see FORK.md): mirror NousResearch/hermes-agent main into the
-# `upstream` branch and propose it to `maiavm` as a reviewed PR. Never pushes
-# to maiavm itself and never contacts the upstream repo beyond a read-only fetch.
+# `upstream` branch and propose it to `maiavm` as ONE rolling, reviewed PR.
+# Never pushes to maiavm itself and never contacts the upstream repo beyond a
+# read-only fetch.
+#
+# Design notes (2026-11-04):
+# - Weekly, not daily. Upstream moves thousands of commits a day; a daily merge
+#   candidate is not a reviewable unit and mostly produces churn. Daily polling
+#   would only detect; the integration cadence is a human decision.
+# - One bot-owned branch, `bot/upstream-sync`, updated in place. The old
+#   `sync/upstream-YYYYMMDD` scheme created a new branch and PR every day.
+# - A conflict never touches the open branch/PR: it fails the run, writes the
+#   conflicting files to the job summary, and (if MAIAVM_SYNC_ALERT_WEBHOOK is
+#   set) posts them to an external webhook. GitHub Issues are DISABLED on this
+#   repo, so the old `gh issue create` path was a guaranteed silent failure.
+# - The bot refuses to force-push over a branch carrying a human commit, so a
+#   manual conflict resolution is never clobbered.
 
 on:
   schedule:
-    - cron: '17 6 * * *'
+    # 06:17 UTC every Monday. Aligns with hermes-deploy's weekly pin bump.
+    - cron: '17 6 * * 1'
   workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: "Upstream commit to integrate (default: upstream main at run start)"
+        required: false
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
-  issues: write
 
 concurrency:
   group: maiavm-upstream-sync
@@ -22,11 +41,17 @@ jobs:
   sync:
     if: github.repository == 'DevvGwardo/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       # A PAT with Workflows permission is needed to push upstream commits that
-      # touch .github/workflows, and so the sync PR triggers CI (FORK.md).
+      # touch .github/workflows (GITHUB_TOKEN cannot), and so the sync PR
+      # triggers CI. See FORK.md.
       GH_TOKEN: ${{ secrets.MAIAVM_SYNC_TOKEN || github.token }}
+      # Optional alert sink (Slack/Discord/Telegram-bridge webhook). Without it
+      # a conflict is only visible in this run's job summary.
+      MAIAVM_SYNC_ALERT_WEBHOOK: ${{ secrets.MAIAVM_SYNC_ALERT_WEBHOOK }}
+      SYNC_BRANCH: bot/upstream-sync
+      REQUESTED_SHA: ${{ github.event.inputs.upstream_sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -35,61 +60,144 @@ jobs:
           token: ${{ secrets.MAIAVM_SYNC_TOKEN || github.token }}
 
       - name: Fetch upstream (read-only)
+        shell: bash
         run: |
+          set -euo pipefail
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch --no-tags upstream main
+          sha="${REQUESTED_SHA:-$(git rev-parse refs/remotes/upstream/main)}"
+          git rev-parse --verify "$sha^{commit}" >/dev/null
+          echo "UPSTREAM_SHA=$sha" >> "$GITHUB_ENV"
+          echo "Upstream commit: $sha"
 
       - name: Mirror upstream main to the upstream branch
-        run: git push --force origin refs/remotes/upstream/main:refs/heads/upstream
-
-      - name: Merge upstream into a sync branch
-        id: merge
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
+          set -euo pipefail
+          git push --force origin refs/remotes/upstream/main:refs/heads/upstream
+
+      - name: Prepare the rolling sync branch
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          fork_sha="$(git rev-parse HEAD)"
+          echo "FORK_SHA=$fork_sha" >> "$GITHUB_ENV"
+          echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
             echo "state=uptodate" >> "$GITHUB_OUTPUT"
+            echo "maiavm already contains $UPSTREAM_SHA"
             exit 0
           fi
-          branch="sync/upstream-$(date -u +%Y%m%d)"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "behind=$(git rev-list --count HEAD..refs/remotes/upstream/main)" >> "$GITHUB_OUTPUT"
-          git switch -c "$branch"
-          if git merge --no-ff --no-edit -m "Merge upstream/main into maiavm ($(date -u +%Y-%m-%d))" refs/remotes/upstream/main; then
+
+          behind="$(git rev-list --count "HEAD..$UPSTREAM_SHA")"
+          base="$(git merge-base HEAD "$UPSTREAM_SHA")"
+          echo "BEHIND=$behind" >> "$GITHUB_ENV"
+          echo "MERGE_BASE=$base" >> "$GITHUB_ENV"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+
+          # Never clobber a human conflict resolution. If the remote branch has
+          # commits not authored by the bot since maiavm, leave it alone.
+          if git fetch --quiet origin "refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH" 2>/dev/null; then
+            human="$(git log --format='%ae' "$FORK_SHA..origin/$SYNC_BRANCH" 2>/dev/null \
+              | grep -v '^41898282+github-actions\[bot\]@users.noreply.github.com$' \
+              | head -1 || true)"
+            if [ -n "$human" ]; then
+              echo "state=human_branch" >> "$GITHUB_OUTPUT"
+              echo "Remote $SYNC_BRANCH carries a human commit ($human); leaving it for manual resolution."
+              exit 0
+            fi
+          fi
+
+          git switch -c "$SYNC_BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --no-ff --no-edit -m "Merge upstream/main into maiavm ($(date -u +%Y-%m-%d))" "$UPSTREAM_SHA"; then
             echo "state=clean" >> "$GITHUB_OUTPUT"
           else
-            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git diff --name-only --diff-filter=U | sort > "$RUNNER_TEMP/conflicts.txt"
             git merge --abort
             echo "state=conflict" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open the sync PR
-        if: steps.merge.outputs.state == 'clean'
-        env:
-          BRANCH: ${{ steps.merge.outputs.branch }}
-          BEHIND: ${{ steps.merge.outputs.behind }}
+      - name: Push and open/update the rolling PR
+        if: steps.prep.outputs.state == 'clean'
+        shell: bash
         run: |
-          git push --force origin "$BRANCH"
-          if [ -n "$(gh pr list --repo "$GITHUB_REPOSITORY" --base maiavm --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
-            echo "PR already open for $BRANCH"
-            exit 0
-          fi
-          gh pr create --repo "$GITHUB_REPOSITORY" --base maiavm --head "$BRANCH" \
-            --title "sync: merge upstream main into maiavm ($(date -u +%Y-%m-%d))" \
-            --body "Automated upstream sync (see FORK.md). Brings in ${BEHIND} upstream commits; merged cleanly.
-
-          Review before merging — upstream behaviour changes reach production through this PR. After merging, cut a tag with **maiavm release tag** and canary it before bumping the hermes-deploy pin."
-
-      - name: Report conflicts
-        if: steps.merge.outputs.state == 'conflict'
-        env:
-          BEHIND: ${{ steps.merge.outputs.behind }}
-        run: |
-          title="Upstream sync needs conflict resolution"
-          body="$(printf 'The daily upstream sync could not merge %s upstream commits into \x60maiavm\x60 cleanly.\n\nConflicting files:\n\n' "$BEHIND"; sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"; printf '\n\nResolve on a \x60sync/upstream-*\x60 branch from \x60maiavm\x60 (\x60git merge upstream/main\x60) and open a PR into \x60maiavm\x60. See FORK.md.\n')"
-          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number')"
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          set -euo pipefail
+          git push --force-with-lease origin "$SYNC_BRANCH"
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --base maiavm \
+            --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')"
+          {
+            echo "Automated upstream integration candidate (see FORK.md)."
+            echo ""
+            echo "- Upstream commit: \`$UPSTREAM_SHA\`"
+            echo "- \`maiavm\` before this merge: \`$FORK_SHA\`"
+            echo "- Merge base: \`$MERGE_BASE\`"
+            echo "- Upstream commits brought in: $BEHIND"
+            echo ""
+            echo "Review before merging — upstream behaviour changes reach production"
+            echo "through this PR. After merging, cut a tag with **maiavm release tag**"
+            echo "and canary one VM before bumping the hermes-deploy pin."
+          } > "$RUNNER_TEMP/pr-body.md"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/pr-body.md"
+            echo "Updated PR #$pr_number"
           else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            gh pr create --repo "$GITHUB_REPOSITORY" --base maiavm --head "$SYNC_BRANCH" \
+              --title "sync: upstream main into maiavm ($(date -u +%Y-%m-%d))" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
           fi
+
+      - name: Report a conflict
+        if: steps.prep.outputs.state == 'conflict'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Upstream sync blocked"
+            echo ""
+            echo "Could not merge \`$UPSTREAM_SHA\` into \`maiavm\` cleanly."
+            echo "The existing \`$SYNC_BRANCH\` branch and PR were left untouched."
+            echo ""
+            echo "Conflicting files:"
+            echo ""
+            while IFS= read -r f; do echo "- \`$f\`"; done < "$RUNNER_TEMP/conflicts.txt"
+            echo ""
+            echo "Resolve on a \`sync/*\` branch from \`maiavm\` (\`git merge $UPSTREAM_SHA\`),"
+            echo "push it, and open a PR into \`maiavm\`. See FORK.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+          if [ -n "${MAIAVM_SYNC_ALERT_WEBHOOK:-}" ]; then
+            text="maiavm upstream sync BLOCKED at $UPSTREAM_SHA. Conflicting files: $(paste -sd, "$RUNNER_TEMP/conflicts.txt"). Resolve on a sync/* branch from maiavm and open a PR. The existing bot/upstream-sync PR was left untouched."
+            payload="$(jq -n --arg t "$text" '{text:$t, content:$t}')"
+            curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" \
+              "$MAIAVM_SYNC_ALERT_WEBHOOK" || echo "::warning::sync alert webhook failed"
+          else
+            echo "::warning::MAIAVM_SYNC_ALERT_WEBHOOK is not set; only this run's summary reports the conflict."
+          fi
+          exit 1
+
+      - name: Report a human-owned branch
+        if: steps.prep.outputs.state == 'human_branch'
+        shell: bash
+        run: |
+          {
+            echo "## Sync skipped: human resolution in progress"
+            echo ""
+            echo "\`$SYNC_BRANCH\` carries a commit not authored by the sync bot."
+            echo "Left untouched so a manual conflict resolution is never clobbered."
+            echo "Upstream commit considered: \`$UPSTREAM_SHA\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Report up to date
+        if: steps.prep.outputs.state == 'uptodate'
+        shell: bash
+        run: |
+          {
+            echo "## Nothing to do"
+            echo ""
+            echo "\`maiavm\` already contains \`$UPSTREAM_SHA\`."
+          } >> "$GITHUB_STEP_SUMMARY"

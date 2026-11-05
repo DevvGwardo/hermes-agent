@@ -1,0 +1,81 @@
+name: maiavm sync watchdog
+
+# Fork-only (see FORK.md). The upstream sync can fail silently: a red scheduled
+# run notifies nobody, and a conflict used to try `gh issue create` on a repo
+# where Issues are disabled. This watchdog is the second line of defence — it
+# alerts when the sync has not produced a successful run recently, or has
+# stopped firing at all.
+#
+# Alert sink: MAIAVM_SYNC_ALERT_WEBHOOK (same secret the sync uses). Without it
+# the failure is visible only in this run's summary, so set the secret.
+
+on:
+  schedule:
+    - cron: '43 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  check:
+    if: github.repository == 'DevvGwardo/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MAIAVM_SYNC_ALERT_WEBHOOK: ${{ secrets.MAIAVM_SYNC_ALERT_WEBHOOK }}
+      MAX_SUCCESS_AGE_DAYS: '10'
+      MAX_RUN_AGE_DAYS: '8'
+    steps:
+      - name: Check the sync workflow's freshness
+        shell: bash
+        run: |
+          set -euo pipefail
+          wf="maiavm-upstream-sync.yml"
+          api="repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs"
+          last_success="$(gh api "$api?status=success&per_page=1" --jq '.workflow_runs[0].created_at // empty')"
+          last_any="$(gh api "$api?per_page=1" --jq '.workflow_runs[0].created_at // empty')"
+          now="$(date -u +%s)"
+          problems=""
+
+          age_days() {
+            [ -n "$1" ] || { echo 999999; return; }
+            echo $(( (now - $(date -u -d "$1" +%s)) / 86400 ))
+          }
+
+          success_age="$(age_days "$last_success")"
+          run_age="$(age_days "$last_any")"
+
+          if [ "$run_age" -gt "$MAX_RUN_AGE_DAYS" ]; then
+            problems="${problems}The sync workflow has not run in ${run_age} days (last run: ${last_any:-never}). "
+          fi
+          if [ "$success_age" -gt "$MAX_SUCCESS_AGE_DAYS" ]; then
+            problems="${problems}No successful upstream sync in ${success_age} days (last success: ${last_success:-never}). "
+          fi
+
+          {
+            echo "## maiavm sync watchdog"
+            echo ""
+            echo "- Last sync run: ${last_any:-never} (${run_age} days ago)"
+            echo "- Last successful sync: ${last_success:-never} (${success_age} days ago)"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$problems" ]; then
+            echo "Sync is healthy." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "**ALERT:** $problems" >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+          if [ -n "${MAIAVM_SYNC_ALERT_WEBHOOK:-}" ]; then
+            text="maiavm sync watchdog: ${problems}Check the maiavm-upstream-sync workflow (conflict or disabled schedule)."
+            payload="$(jq -n --arg t "$text" '{text:$t, content:$t}')"
+            curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" \
+              "$MAIAVM_SYNC_ALERT_WEBHOOK" || echo "::warning::watchdog alert webhook failed"
+          else
+            echo "::warning::MAIAVM_SYNC_ALERT_WEBHOOK is not set; only this run's summary reports the alert."
+          fi
+          exit 1
