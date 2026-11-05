@@ -14,7 +14,6 @@ producers: :mod:`hermes_cli.notifications_bus`.
 from __future__ import annotations
 
 import asyncio
-import urllib.request
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query

@@ -22,6 +22,7 @@ that token with one log line until the token changes. No token, no network.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -243,21 +244,32 @@ def mark_read(ids: Iterable[str]) -> int:
 # ---------------------------------------------------------------------------
 
 _SYNC_MAX_THREADS = 100
+_SYNC_WORKERS = 8
+_SYNC_TIMEOUT_S = 5.0
+_SYNC_REQUEST_TIMEOUT_S = 5.0
 
 
-def _urllib_put_json(url: str, headers: Mapping[str, str], payload: Any, timeout: float = 15.0) -> Optional["HttpResult"]:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={**headers, "Content-Type": "application/json"}, method="PUT")
+def _github_patch_thread_read(token: str, thread_id: str, timeout: float = _SYNC_REQUEST_TIMEOUT_S) -> bool:
+    """Mark one GitHub notification thread read. Never raises."""
+    req = urllib.request.Request(
+        f"{GITHUB_API}/threads/{thread_id}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-agent-notifications",
+        },
+        method="PATCH",
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed https host)
-            raw = resp.read(1024 * 1024)
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-            return HttpResult(resp.status, hdrs, json.loads(raw) if raw else None)
+            return resp.status in (200, 204, 205)
     except urllib.error.HTTPError as exc:
-        return HttpResult(exc.code, {k.lower(): v for k, v in (exc.headers or {}).items()}, None)
+        _log.debug("GitHub mark-read rejected for thread %s: HTTP %s", thread_id, exc.code)
+        return False
     except Exception as exc:  # noqa: BLE001 (network, TLS, timeout — fail soft)
-        _log.debug("GitHub mark-read sync request failed: %s", type(exc).__name__)
-        return None
+        _log.debug("GitHub mark-read sync request failed for thread %s: %s", thread_id, type(exc).__name__)
+        return False
 
 
 def _thread_id_for(item_id: str) -> Optional[str]:
@@ -269,11 +281,11 @@ def _thread_id_for(item_id: str) -> Optional[str]:
 
 
 def sync_read_to_github(ids: Iterable[str]) -> int:
-    """Best-effort: mark the given thread ids read at GitHub (PUT /notifications).
+    """Best-effort: mark the given GitHub threads read, one PATCH per thread.
 
-    The inbox's read flag is local only; without this, the next poll re-delivers
-    a thread the user already dismissed as unread whenever GitHub still reports
-    it unread. Never raises; returns the number of thread ids submitted.
+    GitHub has no bulk "these thread ids" endpoint: ``PUT /notifications`` only
+    takes ``last_read_at``/``read`` and would mark unrelated threads. Bounded in
+    count, workers, and wall time; never raises.
     """
     threads = list(
         dict.fromkeys(t for t in (_thread_id_for(i) for i in ids if isinstance(i, str)) if t is not None)
@@ -283,18 +295,19 @@ def sync_read_to_github(ids: Iterable[str]) -> int:
     token = _resolve_token()
     if not token:
         return 0
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "hermes-agent-notifications",
-    }
-    res = _urllib_put_json(GITHUB_API, headers, {"thread_ids": [int(t) for t in threads]})
-    if res is None or res.status not in (200, 202, 204):
-        if res is not None:
-            _log.debug("GitHub mark-read sync rejected: HTTP %s", res.status)
-        return 0
-    return len(threads)
+    submitted = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_SYNC_WORKERS, len(threads))) as pool:
+        futures = [pool.submit(_github_patch_thread_read, token, t) for t in threads]
+        done, not_done = concurrent.futures.wait(futures, timeout=_SYNC_TIMEOUT_S)
+        for fut in done:
+            try:
+                if fut.result():
+                    submitted += 1
+            except Exception:  # noqa: BLE001 (helper is fail-soft; belt and braces)
+                pass
+        for fut in not_done:
+            fut.cancel()
+    return submitted
 
 
 def public_item(item: Mapping[str, Any]) -> Dict[str, Any]:

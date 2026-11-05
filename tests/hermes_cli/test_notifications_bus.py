@@ -370,26 +370,25 @@ def test_resolve_token_prefers_github_token(monkeypatch):
 # -- mark-read → GitHub sync ----------------------------------------------------
 
 
-def test_sync_only_github_thread_ids_are_submitted(monkeypatch):
-    """github:<thread> ids map to thread ids; app/pairing ids never hit the network."""
-    seen = {}
+def test_sync_patches_only_github_threads(monkeypatch):
+    """github:<thread> ids become one PATCH per thread; app/pairing ids never hit the network."""
+    seen = []
 
-    def fake_put(url, headers, payload, timeout=15.0):
-        seen["url"], seen["payload"], seen["auth"] = url, payload, headers.get("Authorization")
-        return bus.HttpResult(202, {}, None)
+    def fake_patch(token, thread_id, timeout=5.0):
+        seen.append((token, thread_id))
+        return True
 
-    monkeypatch.setattr(bus, "_urllib_put_json", fake_put)
+    monkeypatch.setattr(bus, "_github_patch_thread_read", fake_patch)
     monkeypatch.setenv("GITHUB_TOKEN", "gh-sync")
     sent = bus.sync_read_to_github(["github:1001", "github:1002", "github:1001", "reply:abc", "pairing:x", "routine:j1:t"])
     assert sent == 2
-    assert seen["url"] == "https://api.github.com/notifications"
-    assert seen["payload"] == {"thread_ids": [1001, 1002]}
-    assert seen["auth"] == "Bearer gh-sync"
+    assert sorted(thread for _, thread in seen) == ["1001", "1002"]
+    assert {token for token, _ in seen} == {"gh-sync"}
 
 
 def test_sync_without_a_token_is_a_noop(monkeypatch):
     calls = []
-    monkeypatch.setattr(bus, "_urllib_put_json", lambda *a, **k: calls.append(a) or bus.HttpResult(202, {}, None))
+    monkeypatch.setattr(bus, "_github_patch_thread_read", lambda *a, **k: calls.append(a) or True)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
     assert bus.sync_read_to_github(["github:1001"]) == 0
@@ -397,11 +396,28 @@ def test_sync_without_a_token_is_a_noop(monkeypatch):
 
 
 def test_sync_failure_is_swallowed_and_rejections_do_not_count(monkeypatch):
-    monkeypatch.setattr(bus, "_urllib_put_json", lambda *a, **k: None)  # network error path
+    monkeypatch.setattr(bus, "_github_patch_thread_read", lambda *a, **k: False)
     monkeypatch.setenv("GITHUB_TOKEN", "gh-sync")
     assert bus.sync_read_to_github(["github:1001"]) == 0
-    monkeypatch.setattr(bus, "_urllib_put_json", lambda *a, **k: bus.HttpResult(403, {}, None))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(bus, "_github_patch_thread_read", boom)
     assert bus.sync_read_to_github(["github:1001"]) == 0
+
+
+def test_sync_caps_the_thread_count(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        bus,
+        "_github_patch_thread_read",
+        lambda token, thread_id, timeout=5.0: seen.append(thread_id) or True,
+    )
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-sync")
+    sent = bus.sync_read_to_github([f"github:{i}" for i in range(bus._SYNC_MAX_THREADS + 25)])
+    assert sent == bus._SYNC_MAX_THREADS
+    assert len(seen) == bus._SYNC_MAX_THREADS
 
 
 def test_post_read_route_triggers_the_github_sync(client, monkeypatch):
