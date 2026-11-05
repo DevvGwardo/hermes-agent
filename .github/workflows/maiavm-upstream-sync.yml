@@ -12,9 +12,9 @@ name: maiavm upstream sync
 # - One bot-owned branch, `bot/upstream-sync`, updated in place. The old
 #   `sync/upstream-YYYYMMDD` scheme created a new branch and PR every day.
 # - A conflict never touches the open branch/PR: it fails the run, writes the
-#   conflicting files to the job summary, and (if MAIAVM_SYNC_ALERT_WEBHOOK is
-#   set) posts them to an external webhook. GitHub Issues are DISABLED on this
-#   repo, so the old `gh issue create` path was a guaranteed silent failure.
+#   conflicting files to the job summary, and posts them to Telegram (the ops
+#   bot) or, failing that, a webhook. GitHub Issues are DISABLED on this repo,
+#   so the old `gh issue create` path was a guaranteed silent failure.
 # - The bot refuses to force-push over a branch carrying a human commit, so a
 #   manual conflict resolution is never clobbered.
 
@@ -47,8 +47,10 @@ jobs:
       # touch .github/workflows (GITHUB_TOKEN cannot), and so the sync PR
       # triggers CI. See FORK.md.
       GH_TOKEN: ${{ secrets.MAIAVM_SYNC_TOKEN || github.token }}
-      # Optional alert sink (Slack/Discord/Telegram-bridge webhook). Without it
-      # a conflict is only visible in this run's job summary.
+      # Alert sinks, first configured one wins: the Nub ops Telegram bot (same chat
+      # as the platform's ops alerts), else a Slack/Discord/generic webhook.
+      MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN }}
+      MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID }}
       MAIAVM_SYNC_ALERT_WEBHOOK: ${{ secrets.MAIAVM_SYNC_ALERT_WEBHOOK }}
       SYNC_BRANCH: bot/upstream-sync
       REQUESTED_SHA: ${{ github.event.inputs.upstream_sha }}
@@ -169,14 +171,25 @@ jobs:
             echo "push it, and open a PR into \`maiavm\`. See FORK.md."
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
-          if [ -n "${MAIAVM_SYNC_ALERT_WEBHOOK:-}" ]; then
-            text="maiavm upstream sync BLOCKED at $UPSTREAM_SHA. Conflicting files: $(paste -sd, "$RUNNER_TEMP/conflicts.txt"). Resolve on a sync/* branch from maiavm and open a PR. The existing bot/upstream-sync PR was left untouched."
-            payload="$(jq -n --arg t "$text" '{text:$t, content:$t}')"
-            curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" \
-              "$MAIAVM_SYNC_ALERT_WEBHOOK" || echo "::warning::sync alert webhook failed"
-          else
-            echo "::warning::MAIAVM_SYNC_ALERT_WEBHOOK is not set; only this run's summary reports the conflict."
-          fi
+          send_alert() {
+            local text="$1"
+            if [ -n "${MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN:-}" ] && [ -n "${MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID:-}" ]; then
+              curl -fsS -m 15 -X POST \
+                "https://api.telegram.org/bot${MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID}" \
+                --data-urlencode "text=${text}" \
+                --data-urlencode "disable_web_page_preview=true" >/dev/null \
+                || echo "::warning::telegram alert failed"
+            elif [ -n "${MAIAVM_SYNC_ALERT_WEBHOOK:-}" ]; then
+              local payload
+              payload="$(jq -n --arg t "$text" '{text:$t, content:$t}')"
+              curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" \
+                "$MAIAVM_SYNC_ALERT_WEBHOOK" || echo "::warning::alert webhook failed"
+            else
+              echo "::warning::No alert channel configured (set MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN + _CHAT_ID, or MAIAVM_SYNC_ALERT_WEBHOOK); only this run's summary reports it."
+            fi
+          }
+          send_alert "maiavm upstream sync BLOCKED at $UPSTREAM_SHA. Conflicting files: $(paste -sd, "$RUNNER_TEMP/conflicts.txt"). Resolve on a sync/* branch from maiavm and open a PR. The existing bot/upstream-sync PR was untouched."
           exit 1
 
       - name: Report a human-owned branch

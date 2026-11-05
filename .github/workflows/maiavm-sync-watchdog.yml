@@ -6,8 +6,8 @@ name: maiavm sync watchdog
 # alerts when the sync has not produced a successful run recently, or has
 # stopped firing at all.
 #
-# Alert sink: MAIAVM_SYNC_ALERT_WEBHOOK (same secret the sync uses). Without it
-# the failure is visible only in this run's summary, so set the secret.
+# Alert sink: the same Telegram bot + chat (or webhook) the sync uses. Without one
+# the failure is visible only in this run's summary.
 
 on:
   schedule:
@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
+      MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN }}
+      MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID }}
       MAIAVM_SYNC_ALERT_WEBHOOK: ${{ secrets.MAIAVM_SYNC_ALERT_WEBHOOK }}
       MAX_SUCCESS_AGE_DAYS: '10'
       MAX_RUN_AGE_DAYS: '8'
@@ -70,12 +72,23 @@ jobs:
 
           echo "**ALERT:** $problems" >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
-          if [ -n "${MAIAVM_SYNC_ALERT_WEBHOOK:-}" ]; then
-            text="maiavm sync watchdog: ${problems}Check the maiavm-upstream-sync workflow (conflict or disabled schedule)."
-            payload="$(jq -n --arg t "$text" '{text:$t, content:$t}')"
-            curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" \
-              "$MAIAVM_SYNC_ALERT_WEBHOOK" || echo "::warning::watchdog alert webhook failed"
-          else
-            echo "::warning::MAIAVM_SYNC_ALERT_WEBHOOK is not set; only this run's summary reports the alert."
-          fi
+          send_alert() {
+            local text="$1"
+            if [ -n "${MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN:-}" ] && [ -n "${MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID:-}" ]; then
+              curl -fsS -m 15 -X POST \
+                "https://api.telegram.org/bot${MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID}" \
+                --data-urlencode "text=${text}" \
+                --data-urlencode "disable_web_page_preview=true" >/dev/null \
+                || echo "::warning::telegram alert failed"
+            elif [ -n "${MAIAVM_SYNC_ALERT_WEBHOOK:-}" ]; then
+              local payload
+              payload="$(jq -n --arg t "$text" '{text:$t, content:$t}')"
+              curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" \
+                "$MAIAVM_SYNC_ALERT_WEBHOOK" || echo "::warning::alert webhook failed"
+            else
+              echo "::warning::No alert channel configured (set MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN + _CHAT_ID, or MAIAVM_SYNC_ALERT_WEBHOOK); only this run's summary reports it."
+            fi
+          }
+          send_alert "maiavm sync watchdog: ${problems}Check the maiavm-upstream-sync workflow (conflict or disabled schedule)."
           exit 1
