@@ -238,6 +238,65 @@ def mark_read(ids: Iterable[str]) -> int:
         return changed
 
 
+# ---------------------------------------------------------------------------
+# Mark-read → GitHub sync
+# ---------------------------------------------------------------------------
+
+_SYNC_MAX_THREADS = 100
+
+
+def _urllib_put_json(url: str, headers: Mapping[str, str], payload: Any, timeout: float = 15.0) -> Optional["HttpResult"]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={**headers, "Content-Type": "application/json"}, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed https host)
+            raw = resp.read(1024 * 1024)
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            return HttpResult(resp.status, hdrs, json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as exc:
+        return HttpResult(exc.code, {k.lower(): v for k, v in (exc.headers or {}).items()}, None)
+    except Exception as exc:  # noqa: BLE001 (network, TLS, timeout — fail soft)
+        _log.debug("GitHub mark-read sync request failed: %s", type(exc).__name__)
+        return None
+
+
+def _thread_id_for(item_id: str) -> Optional[str]:
+    """Server ids are ``github:<thread>``; anything else (app, pairing) has no thread."""
+    if item_id.startswith("github:"):
+        thread = item_id[len("github:"):]
+        return thread if thread.isdigit() else None
+    return None
+
+
+def sync_read_to_github(ids: Iterable[str]) -> int:
+    """Best-effort: mark the given thread ids read at GitHub (PUT /notifications).
+
+    The inbox's read flag is local only; without this, the next poll re-delivers
+    a thread the user already dismissed as unread whenever GitHub still reports
+    it unread. Never raises; returns the number of thread ids submitted.
+    """
+    threads = list(
+        dict.fromkeys(t for t in (_thread_id_for(i) for i in ids if isinstance(i, str)) if t is not None)
+    )[:_SYNC_MAX_THREADS]
+    if not threads:
+        return 0
+    token = _resolve_token()
+    if not token:
+        return 0
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "hermes-agent-notifications",
+    }
+    res = _urllib_put_json(GITHUB_API, headers, {"thread_ids": [int(t) for t in threads]})
+    if res is None or res.status not in (200, 202, 204):
+        if res is not None:
+            _log.debug("GitHub mark-read sync rejected: HTTP %s", res.status)
+        return 0
+    return len(threads)
+
+
 def public_item(item: Mapping[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"id": item["id"], "title": item["title"], "read": bool(item.get("read"))}
     for key in ("source", "kind", "reason", "url", "repo", "at"):

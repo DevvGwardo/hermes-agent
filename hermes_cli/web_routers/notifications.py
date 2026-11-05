@@ -14,6 +14,7 @@ producers: :mod:`hermes_cli.notifications_bus`.
 from __future__ import annotations
 
 import asyncio
+import urllib.request
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -46,4 +47,8 @@ async def get_notifications(since: Optional[str] = Query(default=None, max_lengt
 async def post_notifications_read(body: _ReadBody):
     ids = [i for i in body.ids if 0 < len(i) <= _MAX_ID_LEN]
     updated = await asyncio.to_thread(bus.mark_read, ids)
+    # Best-effort: tell GitHub these threads are read, so the next poll does
+    # not re-deliver them unread. Never blocks the local mark (fail-soft, and
+    # the sync runs after the inbox update is already saved).
+    await asyncio.to_thread(bus.sync_read_to_github, ids)
     return {"ok": True, "updated": updated}
