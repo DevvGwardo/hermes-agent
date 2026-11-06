@@ -287,11 +287,14 @@ def sync_read_to_github(ids: Iterable[str]) -> int:
     takes ``last_read_at``/``read`` and would mark unrelated threads. Bounded in
     count, workers, and wall time; never raises.
     """
-    threads = list(
+    all_threads = list(
         dict.fromkeys(t for t in (_thread_id_for(i) for i in ids if isinstance(i, str)) if t is not None)
-    )[:_SYNC_MAX_THREADS]
+    )
+    threads = all_threads[:_SYNC_MAX_THREADS]
     if not threads:
         return 0
+    if len(all_threads) > len(threads):
+        _log.debug("GitHub mark-read sync capped at %s of %s threads", len(threads), len(all_threads))
     token = _resolve_token()
     if not token:
         return 0
@@ -307,6 +310,10 @@ def sync_read_to_github(ids: Iterable[str]) -> int:
                 pass
         for fut in not_done:
             fut.cancel()
+        if not_done:
+            _log.debug("GitHub mark-read sync timed out for %s of %s threads", len(not_done), len(threads))
+        if submitted < len(threads):
+            _log.debug("GitHub mark-read sync marked %s of %s threads read", submitted, len(threads))
     return submitted
 
 
