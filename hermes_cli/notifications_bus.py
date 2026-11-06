@@ -22,6 +22,7 @@ that token with one log line until the token changes. No token, no network.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -236,6 +237,84 @@ def mark_read(ids: Iterable[str]) -> int:
         if changed:
             _save(items)
         return changed
+
+
+# ---------------------------------------------------------------------------
+# Mark-read → GitHub sync
+# ---------------------------------------------------------------------------
+
+_SYNC_MAX_THREADS = 100
+_SYNC_WORKERS = 8
+_SYNC_TIMEOUT_S = 5.0
+_SYNC_REQUEST_TIMEOUT_S = 5.0
+
+
+def _github_patch_thread_read(token: str, thread_id: str, timeout: float = _SYNC_REQUEST_TIMEOUT_S) -> bool:
+    """Mark one GitHub notification thread read. Never raises."""
+    req = urllib.request.Request(
+        f"{GITHUB_API}/threads/{thread_id}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-agent-notifications",
+        },
+        method="PATCH",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (fixed https host)
+            return resp.status in (200, 204, 205)
+    except urllib.error.HTTPError as exc:
+        _log.debug("GitHub mark-read rejected for thread %s: HTTP %s", thread_id, exc.code)
+        return False
+    except Exception as exc:  # noqa: BLE001 (network, TLS, timeout — fail soft)
+        _log.debug("GitHub mark-read sync request failed for thread %s: %s", thread_id, type(exc).__name__)
+        return False
+
+
+def _thread_id_for(item_id: str) -> Optional[str]:
+    """Server ids are ``github:<thread>``; anything else (app, pairing) has no thread."""
+    if item_id.startswith("github:"):
+        thread = item_id[len("github:"):]
+        return thread if thread.isdigit() else None
+    return None
+
+
+def sync_read_to_github(ids: Iterable[str]) -> int:
+    """Best-effort: mark the given GitHub threads read, one PATCH per thread.
+
+    GitHub has no bulk "these thread ids" endpoint: ``PUT /notifications`` only
+    takes ``last_read_at``/``read`` and would mark unrelated threads. Bounded in
+    count, workers, and wall time; never raises.
+    """
+    all_threads = list(
+        dict.fromkeys(t for t in (_thread_id_for(i) for i in ids if isinstance(i, str)) if t is not None)
+    )
+    threads = all_threads[:_SYNC_MAX_THREADS]
+    if not threads:
+        return 0
+    if len(all_threads) > len(threads):
+        _log.debug("GitHub mark-read sync capped at %s of %s threads", len(threads), len(all_threads))
+    token = _resolve_token()
+    if not token:
+        return 0
+    submitted = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_SYNC_WORKERS, len(threads))) as pool:
+        futures = [pool.submit(_github_patch_thread_read, token, t) for t in threads]
+        done, not_done = concurrent.futures.wait(futures, timeout=_SYNC_TIMEOUT_S)
+        for fut in done:
+            try:
+                if fut.result():
+                    submitted += 1
+            except Exception:  # noqa: BLE001 (helper is fail-soft; belt and braces)
+                pass
+        for fut in not_done:
+            fut.cancel()
+        if not_done:
+            _log.debug("GitHub mark-read sync timed out for %s of %s threads", len(not_done), len(threads))
+        if submitted < len(threads):
+            _log.debug("GitHub mark-read sync marked %s of %s threads read", submitted, len(threads))
+    return submitted
 
 
 def public_item(item: Mapping[str, Any]) -> Dict[str, Any]:

@@ -5,10 +5,13 @@ Covers the GitHub mapping, the store (dedup, one item per thread, cap, 0600), th
 403 disable, rate limit, backoff, token rotation).
 """
 
+import http.server
 import json
+import logging
 import os
 import stat
 import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -365,6 +368,154 @@ def test_resolve_token_prefers_github_token(monkeypatch):
     assert bus._resolve_token() == "gh-fallback"
     monkeypatch.setenv("GITHUB_TOKEN", "gh-primary")
     assert bus._resolve_token() == "gh-primary"
+
+
+# -- mark-read → GitHub sync ----------------------------------------------------
+
+
+class _ThreadPatchHandler(http.server.BaseHTTPRequestHandler):
+    def do_PATCH(self):
+        self.server.seen.append(
+            {
+                "method": self.command,
+                "path": self.path,
+                "auth": self.headers.get("Authorization"),
+                "api_version": self.headers.get("X-GitHub-Api-Version"),
+            }
+        )
+        self.send_response(self.server.status)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def test_patch_thread_read_uses_the_thread_endpoint(monkeypatch):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ThreadPatchHandler)
+    server.daemon_threads = True
+    server.seen = []
+    server.status = 205
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(bus, "GITHUB_API", f"http://127.0.0.1:{server.server_port}/notifications")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        monkeypatch.setenv("no_proxy", "127.0.0.1")
+        assert bus._github_patch_thread_read("tok", "1001") is True
+        assert server.seen == [
+            {
+                "method": "PATCH",
+                "path": "/notifications/threads/1001",
+                "auth": "Bearer tok",
+                "api_version": "2022-11-28",
+            }
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_patch_thread_read_fails_soft_on_403_and_network_error(monkeypatch):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ThreadPatchHandler)
+    server.daemon_threads = True
+    server.seen = []
+    server.status = 403
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(bus, "GITHUB_API", f"http://127.0.0.1:{server.server_port}/notifications")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        monkeypatch.setenv("no_proxy", "127.0.0.1")
+        assert bus._github_patch_thread_read("tok", "1001") is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    def boom(*args, **kwargs):
+        raise OSError("network down")
+
+    monkeypatch.setattr(bus.urllib.request, "urlopen", boom)
+    assert bus._github_patch_thread_read("tok", "1001") is False
+
+
+def test_sync_patches_only_github_threads(monkeypatch):
+    """github:<thread> ids become one PATCH per thread; app/pairing ids never hit the network."""
+    seen = []
+
+    def fake_patch(token, thread_id, timeout=5.0):
+        seen.append((token, thread_id))
+        return True
+
+    monkeypatch.setattr(bus, "_github_patch_thread_read", fake_patch)
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-sync")
+    sent = bus.sync_read_to_github(["github:1001", "github:1002", "github:1001", "reply:abc", "pairing:x", "routine:j1:t"])
+    assert sent == 2
+    assert sorted(thread for _, thread in seen) == ["1001", "1002"]
+    assert {token for token, _ in seen} == {"gh-sync"}
+
+
+def test_sync_without_a_token_is_a_noop(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bus, "_github_patch_thread_read", lambda *a, **k: calls.append(a) or True)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    assert bus.sync_read_to_github(["github:1001"]) == 0
+    assert calls == []
+
+
+def test_sync_failure_is_swallowed_and_rejections_do_not_count(monkeypatch):
+    monkeypatch.setattr(bus, "_github_patch_thread_read", lambda *a, **k: False)
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-sync")
+    assert bus.sync_read_to_github(["github:1001"]) == 0
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(bus, "_github_patch_thread_read", boom)
+    assert bus.sync_read_to_github(["github:1001"]) == 0
+
+
+def test_sync_caps_the_thread_count(monkeypatch, caplog):
+    seen = []
+    monkeypatch.setattr(
+        bus,
+        "_github_patch_thread_read",
+        lambda token, thread_id, timeout=5.0: seen.append(thread_id) or True,
+    )
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-sync")
+    with caplog.at_level(logging.DEBUG, logger="hermes_cli.notifications_bus"):
+        sent = bus.sync_read_to_github([f"github:{i}" for i in range(bus._SYNC_MAX_THREADS + 25)])
+    assert sent == bus._SYNC_MAX_THREADS
+    assert len(seen) == bus._SYNC_MAX_THREADS
+    assert "capped" in caplog.text
+
+
+def test_sync_logs_timed_out_threads(monkeypatch, caplog):
+    monkeypatch.setattr(bus, "_SYNC_TIMEOUT_S", 0.01)
+
+    def slow(*args, **kwargs):
+        time.sleep(0.05)
+        return True
+
+    monkeypatch.setattr(bus, "_github_patch_thread_read", slow)
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-sync")
+    with caplog.at_level(logging.DEBUG, logger="hermes_cli.notifications_bus"):
+        assert bus.sync_read_to_github(["github:1001"]) == 0
+    assert "timed out" in caplog.text
+
+
+def test_post_read_route_triggers_the_github_sync(client, monkeypatch):
+    _auth(client)
+    synced = {}
+    monkeypatch.setattr(bus, "sync_read_to_github", lambda ids: synced.setdefault("ids", list(ids)) or 0)
+    item = bus.map_github_notification(_gh())
+    bus.add_notifications([item])
+    res = client.post("/api/notifications/read", json={"ids": [item["id"]]})
+    assert res.status_code == 200
+    assert synced.get("ids") == [item["id"]]
+    assert client.get("/api/notifications").json()["notifications"][0]["read"] is True
 
 
 def test_parse_at_accepts_z_and_offsets():
