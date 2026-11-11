@@ -28,6 +28,11 @@ Endpoints (registered by the install-runs-overlay patch in api_server.py):
     grace TTL expires. After the run completes the stream replays
     the full event log and then closes immediately.
 
+    Assistant text streams as ``message.delta``; ``message.segment``
+    (1-based ``index``) marks where a mid-turn assistant-text run ends,
+    so the chat can render each part of one reply as its own bubble.
+    Clients that don't know the event ignore it.
+
 - GET /v1/dashboard/runs/{run_id}
     JSON snapshot of run state. Polling fallback for clients that
     can't hold an SSE connection.
@@ -444,14 +449,55 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
         broker = RunPromptBroker(capabilities, _prompt_emit, lambda _summary: None)
         buf._prompt_broker = broker
 
+    # Segment boundaries for the dashboard chat: a run of streamed assistant
+    # text closed by a tool batch is one bubble. ``streamed_since_segment`` is
+    # raised by message.delta and lowered by a marker; ``segment_index`` is
+    # 1-based over the markers this run emitted.
+    segment_index = 0
+    streamed_since_segment = False
+
     def _on_delta(delta: Optional[str]) -> None:
+        nonlocal streamed_since_segment
         # The agent emits None as a CLI box-close signal, not EOS.
         if delta is None:
             return
+        if delta:
+            streamed_since_segment = True
         buf.append_threadsafe(loop, {
             "event": "message.delta",
             "run_id": run_id,
             "delta": delta,
+        })
+
+    def _on_interim(text: str, *, already_streamed: bool = False) -> None:
+        """Close the streamed assistant-text run before a tool batch.
+
+        The dashboard joins every ``message.delta`` into one growing bubble, so
+        a reply that narrates before each tool call would otherwise read as a
+        single wall of text. ``already_streamed=False`` means these tokens never
+        left the agent as deltas: send them as one first, so the marker never
+        hides them. Only text actually streamed since the last marker opens a
+        segment, so two tool rounds with no text between them emit one marker,
+        never an empty segment.
+
+        ``_create_agent`` drops this callback when
+        ``display.interim_assistant_messages`` is off (api_server parity), and
+        the platform still infers the same break from ``tool.started``.
+        """
+        nonlocal segment_index, streamed_since_segment
+        if not isinstance(text, str) or not text.strip():
+            return
+        if not already_streamed:
+            _on_delta(text)
+        if not streamed_since_segment:
+            return
+        segment_index += 1
+        streamed_since_segment = False
+        buf.append_threadsafe(loop, {
+            "event": "message.segment",
+            "run_id": run_id,
+            "index": segment_index,
+            "timestamp": time.time(),
         })
 
     def _on_tool_progress(event_type: str, tool_name: Optional[str] = None,
@@ -573,6 +619,7 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
                     session_id=session_id,
                     stream_delta_callback=_on_delta,
                     tool_progress_callback=_on_tool_progress,
+                    interim_assistant_callback=_on_interim,
                     **extra,
                 )
             if wants_clarify:
