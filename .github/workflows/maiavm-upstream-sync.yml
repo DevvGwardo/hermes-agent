@@ -20,8 +20,11 @@ name: maiavm upstream sync
 
 on:
   schedule:
-    # 06:17 UTC every Monday. Aligns with hermes-deploy's weekly pin bump.
-    - cron: '17 6 * * 1'
+    # 06:23 UTC every Monday. Aligns with hermes-deploy's weekly pin bump.
+    # 2026-11-16: jittered + file touched to re-register the schedule — GitHub
+    # silently dropped both fork crons after the 2026-11-05 default-branch
+    # switch (zero scheduled runs since; dispatch still worked).
+    - cron: '23 6 * * 1'
   workflow_dispatch:
     inputs:
       upstream_sha:
