@@ -537,6 +537,8 @@ class TestRemoteKillOnTimeout:
         env._kill_process(proc)
         assert len(reaped) == 1
 
+    @pytest.mark.skipif(os.name != "posix",
+                        reason="os.getpgrp() is POSIX-only; Windows has no process groups here")
     def test_a_loopback_target_spares_the_callers_group(self, monkeypatch):
         env = SSHEnvironment(host="127.0.0.1", user="u")
         proc, _ = self._spawn(monkeypatch, env)

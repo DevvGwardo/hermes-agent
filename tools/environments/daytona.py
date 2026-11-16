@@ -192,7 +192,7 @@ class DaytonaEnvironment(BaseEnvironment):
             if self._sync_manager:
                 logger.info("Daytona: syncing files from sandbox...")
                 try:
-                    self._sync_manager.sync_back()
+                    self._sync_manager.sync_back_bounded()
                 except Exception as e:
                     logger.warning("Daytona: sync_back failed: %s", e)
             try:

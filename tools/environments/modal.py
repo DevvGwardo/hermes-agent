@@ -257,7 +257,7 @@ class ModalEnvironment(BaseEnvironment):
             return
         if self._sync_manager:
             logger.info("Modal: syncing files from sandbox...")
-            self._sync_manager.sync_back()
+            self._sync_manager.sync_back_bounded()
         if self._persistent:
             async def _snapshot():
                 # ttl=None: the SDK default (30 days) would silently expire an idle

@@ -22,12 +22,12 @@ try:
 except ImportError:
     fcntl = None  # Windows — file locking skipped
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import psutil
 
 from hermes_constants import get_hermes_home
-from tools.environments.base import _file_mtime_key
+from tools.environments.base import EnvironmentConnectionError, _file_mtime_key
 from utils import mtime_is_racy
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,41 @@ _SYNC_BACK_TEMP_PREFIX = "hermes-sync-back-"
 # download is bounded by a 120 s subprocess timeout, so a live transfer is minutes old at
 # most; the old 6 h window let a crash loop pile up tens of GB before anything was reclaimed.
 _SYNC_BACK_STALE_SECONDS = 30 * 60
+# A cleanup() must never wedge a turn: the whole sync-back runs under a wall
+# clock (daemon thread, abandoned on timeout — the flock keeps a straggler
+# from corrupting state), and each lock wait is bounded so a wedged holder
+# surfaces as logged failures instead of an infinite silent queue. The VM
+# wedge (DevvGwardo/hermes-agent#23) was exactly that queue: one hung sync
+# held .sync.lock and every later turn's cleanup blocked forever on flock.
+_SYNC_BACK_LOCK_TIMEOUT_KEY = "sync_back_lock_timeout_s"  # config.yaml terminal.<key>
+_SYNC_BACK_LOCK_TIMEOUT_S = 30.0
+_SYNC_BACK_CLEANUP_TIMEOUT_KEY = "sync_back_cleanup_timeout_s"  # config.yaml terminal.<key>
+_SYNC_BACK_CLEANUP_TIMEOUT_S = 300.0
+
+
+def _terminal_config_seconds(key: str, default: float) -> float:
+    """A positive-seconds knob from config.yaml ``terminal.<key>``; falls back to *default*."""
+    from hermes_cli.config import load_config
+
+    raw = ((load_config() or {}).get("terminal") or {}).get(key)
+    if raw is not None:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("sync_back: ignoring non-numeric terminal.%s=%r", key, raw)
+        else:
+            if value > 0:
+                return value
+            logger.warning("sync_back: ignoring non-positive terminal.%s=%r", key, raw)
+    return default
+
+
+def _sync_back_lock_timeout_s() -> float:
+    return _terminal_config_seconds(_SYNC_BACK_LOCK_TIMEOUT_KEY, _SYNC_BACK_LOCK_TIMEOUT_S)
+
+
+def _sync_back_cleanup_timeout_s() -> float:
+    return _terminal_config_seconds(_SYNC_BACK_CLEANUP_TIMEOUT_KEY, _SYNC_BACK_CLEANUP_TIMEOUT_S)
 
 
 def _sync_back_max_bytes() -> int:
@@ -80,9 +115,33 @@ def _sync_back_max_bytes() -> int:
     return _SYNC_BACK_MAX_BYTES
 
 
+class _SyncBackKnobs(NamedTuple):
+    """The sync-back config knobs, resolved together on ONE thread.
+
+    Every knob read funnels through ``load_config()``. CPython may run ``__del__``
+    (→ BaseEnvironment.cleanup() → sync_back_bounded) at ANY bytecode boundary —
+    including mid-``load_config``, while the interrupted thread holds the config
+    cache lock — so a knob read on the sync-back WORKER thread can block on that
+    lock while the caller waits on the worker's done-Event: a mutual wait
+    (a #23 follow-up; hung test_ssh_environment.py live until its wall clock
+    expired). Resolving every knob up front on the calling thread (where the
+    config lock is reentrant even when held) and passing the values down keeps
+    the worker off the config lock's slow path — the resolve also warms
+    ``_LOAD_CONFIG_CACHE``, so the worker's own reads stay on the lock-free
+    fast path.
+    """
+
+    lock_timeout_s: float
+    max_bytes: int
+
+
+def _sync_back_knobs() -> _SyncBackKnobs:
+    return _SyncBackKnobs(
+        lock_timeout_s=_sync_back_lock_timeout_s(), max_bytes=_sync_back_max_bytes())
+
+
 def _sync_back_skills_enabled() -> bool:
     """config.yaml ``terminal.sync_back_skills`` (default off): pull sandbox skill edits home.
-
     Off by default because the remote copy of the skills tree is writable by whatever runs in
     the sandbox, and syncing it back would persist edits into every later session without
     skill_manage's scan (Maia-VM/hermes-deploy#210)."""
@@ -254,8 +313,15 @@ class FileSyncManager:
         per ``sync_interval`` unless *force* or ``HERMES_FORCE_FILE_SYNC=1``. Transactional:
         state is committed only if ALL operations succeed; on failure it rolls back so the
         next cycle retries everything."""
-        with self._transaction_lock:
+        # Bounded: a wedged holder must skip a cycle, not queue forever.
+        if not self._transaction_lock.acquire(timeout=_sync_back_lock_timeout_s()):
+            logger.warning("file_sync: transaction lock busy for >%.0fs — skipping this sync cycle",
+                           _sync_back_lock_timeout_s())
+            return
+        try:
             self._sync_transaction(force=force)
+        finally:
+            self._transaction_lock.release()
 
     def _sync_transaction(self, *, force: bool = False) -> None:
         """Execute one sync cycle while holding the per-manager lock."""
@@ -346,14 +412,59 @@ class FileSyncManager:
             logger.debug("file_sync: deleted %s", to_delete)
 
     # --- Sync-back: pull remote changes to host on teardown ---
-    def sync_back(self, hermes_home: Path | None = None) -> None:
+    def sync_back(self, hermes_home: Path | None = None, *,
+                  knobs: "_SyncBackKnobs | None" = None) -> None:
         """Pull remote changes back to the host: download the remote ``.hermes/`` as a tar and
         apply only files whose SHA-256 differs from what was pushed. SIGINT is deferred until
-        complete; concurrent gateway sandboxes are serialized via a file lock."""
-        with self._transaction_lock:
-            self._sync_back_transaction(hermes_home=hermes_home)
+        complete; concurrent gateway sandboxes are serialized via a file lock.
 
-    def _sync_back_transaction(self, hermes_home: Path | None = None) -> None:
+        The config knobs are resolved on the CALLING thread (see ``_SyncBackKnobs``);
+        pass ``knobs`` when invoking from the sync_back_bounded worker."""
+        resolved = knobs if knobs is not None else _sync_back_knobs()
+        # Bounded: a wedged holder must surface as a skip, not queue forever.
+        if not self._transaction_lock.acquire(timeout=resolved.lock_timeout_s):
+            logger.warning("sync_back: transaction lock busy for >%.0fs — skipping sync-back",
+                           resolved.lock_timeout_s)
+            return
+        try:
+            self._sync_back_transaction(hermes_home=hermes_home, knobs=resolved)
+        finally:
+            self._transaction_lock.release()
+
+    def sync_back_bounded(self, timeout_s: float | None = None) -> bool:
+        """sync_back under a wall clock, for teardown paths: True when it completed, False when
+        the cap hit (a daemon thread finishes — or dies with the process — in the background;
+        the flock serializes it against later syncs, so abandoning is safe). cleanup() must
+        never wedge a turn no matter what sync_back does internally (#23).
+
+        The cap AND the config knobs resolve here, on the calling thread, BEFORE the worker
+        starts: the worker must never take the config cache lock's slow path — a ``__del__``
+        can interrupt the caller mid-``load_config`` (lock held), and a worker-side knob read
+        would then block on that lock while the caller waits on the worker (see
+        ``_SyncBackKnobs``)."""
+        timeout = timeout_s if timeout_s is not None else _sync_back_cleanup_timeout_s()
+        knobs = _sync_back_knobs()
+        done = threading.Event()
+
+        def _run() -> None:
+            try:
+                self.sync_back(knobs=knobs)
+            except Exception:
+                logger.exception("sync_back: failed")
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_run, daemon=True, name="hermes-sync-back")
+        worker.start()
+        if not done.wait(timeout):
+            logger.warning(
+                "sync_back: exceeded %.0fs wall clock — proceeding without it "
+                "(the lock keeps a straggler consistent; a later sync picks up changes)", timeout)
+            return False
+        return True
+
+    def _sync_back_transaction(self, hermes_home: Path | None = None, *,
+                               knobs: "_SyncBackKnobs | None" = None) -> None:
         """Execute sync-back (with retries) against a stable snapshot of manager state."""
         if self._bulk_download_fn is None:
             return
@@ -370,7 +481,7 @@ class FileSyncManager:
         last_exc: Exception | None = None
         for attempt in range(_SYNC_BACK_MAX_RETRIES):
             try:
-                self._sync_back_once(lock_path)
+                self._sync_back_once(lock_path, knobs)
                 return
             except Exception as exc:
                 last_exc = exc
@@ -381,7 +492,7 @@ class FileSyncManager:
 
         logger.warning("sync_back: all %d attempts failed: %s", _SYNC_BACK_MAX_RETRIES, last_exc)
 
-    def _sync_back_once(self, lock_path: Path) -> None:
+    def _sync_back_once(self, lock_path: Path, knobs: "_SyncBackKnobs | None" = None) -> None:
         """Single sync-back attempt with SIGINT protection and file lock."""
         # signal.signal() only works from the main thread; gateway cleanup()
         # may run from a worker thread — skip SIGINT deferral there.
@@ -398,7 +509,7 @@ class FileSyncManager:
 
             signal.signal(signal.SIGINT, _defer_sigint)
         try:
-            self._sync_back_locked(lock_path)
+            self._sync_back_locked(lock_path, knobs)
         finally:
             if on_main_thread and original_handler is not None:
                 signal.signal(signal.SIGINT, original_handler)
@@ -408,15 +519,28 @@ class FileSyncManager:
                     # the CLI); ``raise_signal`` invokes the handler everywhere.
                     signal.raise_signal(signal.SIGINT)
 
-    def _sync_back_locked(self, lock_path: Path) -> None:
-        """Sync-back under file lock (serializes concurrent gateways)."""
+    def _sync_back_locked(self, lock_path: Path, knobs: "_SyncBackKnobs | None" = None) -> None:
+        """Sync-back under file lock (serializes concurrent gateways). The flock is bounded:
+        a holder wedged mid-sync must surface as a retryable failure, not an infinite
+        silent queue behind .sync.lock (#23)."""
         if fcntl is None:
             # Windows: no flock — run without serialization
-            self._sync_back_impl()
+            self._sync_back_impl(knobs=knobs)
             return
+        timeout_s = (knobs if knobs is not None else _sync_back_knobs()).lock_timeout_s
+        deadline = _monotonic() + timeout_s
         lock_fd = open(lock_path, "w", encoding="utf-8")
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if _monotonic() >= deadline:
+                        raise EnvironmentConnectionError(
+                            f"sync-back lock {lock_path.name} still held after {timeout_s:.0f}s "
+                            "(another sandbox's sync is wedged) — giving up")
+                    time.sleep(0.2)
             self._sync_back_impl()
         finally:
             try:
@@ -425,8 +549,9 @@ class FileSyncManager:
                 pass
             lock_fd.close()
 
-    def _sync_back_impl(self) -> None:
-        """Download, diff, and apply remote changes to host."""
+    def _sync_back_impl(self, knobs: "_SyncBackKnobs | None" = None) -> None:
+        """Download, diff, and apply remote changes to host. ``knobs`` is passed by the
+        sync_back_bounded worker (resolved on the calling thread — see ``_SyncBackKnobs``)."""
         if self._bulk_download_fn is None:
             raise RuntimeError("_sync_back_impl called without bulk_download_fn")
 
@@ -452,7 +577,7 @@ class FileSyncManager:
                 tar_size = os.path.getsize(tar_path)
             except OSError:
                 tar_size = 0
-            max_bytes = _sync_back_max_bytes()
+            max_bytes = (knobs if knobs is not None else _sync_back_knobs()).max_bytes
             if tar_size > max_bytes:
                 logger.warning(
                     "sync_back: remote tar is %d bytes (cap %d, override with terminal.%s) — skipping extraction",

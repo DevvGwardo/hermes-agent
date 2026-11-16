@@ -160,8 +160,14 @@ class TestSSHCleanup:
             def sync(self, **kw):
                 pass
 
-            def sync_back(self):
+            def sync_back(self, **_kwargs):
                 call_order.append("sync_back")
+
+            # cleanup() now goes through the bounded wrapper (#23): the wall
+            # clock, not a direct sync_back() call.
+            def sync_back_bounded(self, **_kwargs):
+                call_order.append("sync_back")
+                return True
 
         monkeypatch.setattr(ssh_env, "FileSyncManager", TrackingSyncManager)
 
@@ -216,7 +222,7 @@ class TestModalCleanup:
 
         call_order = []
         sync_mgr = MagicMock()
-        sync_mgr.sync_back = lambda: call_order.append("sync_back")
+        sync_mgr.sync_back_bounded = lambda **_kw: call_order.append("sync_back")
         env._sync_manager = sync_mgr
 
         # Mock terminate to track call order
@@ -292,7 +298,7 @@ class TestDaytonaCleanup:
 
         call_order = []
         sync_mgr = MagicMock()
-        sync_mgr.sync_back = lambda: call_order.append("sync_back")
+        sync_mgr.sync_back_bounded = lambda **_kw: call_order.append("sync_back")
         env._sync_manager = sync_mgr
         env._sandbox.stop = lambda: call_order.append("stop")
 

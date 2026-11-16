@@ -15,9 +15,44 @@ logger = logging.getLogger("tools.mcp_tool")
 # Live stdio MCP children (pid -> server_name), added after connection and removed on normal
 # shutdown, so they can be force-killed if SDK teardown fails.
 _stdio_pids: dict[int, str] = {}
+
 # PIDs that survived their session context exit (detected in _run_stdio's finally, reaped by
 # _kill_orphaned_mcp_children). Separate from _stdio_pids so sweeps never race active sessions.
 _orphan_stdio_pids: set = set()
+
+# Helper fan-out cap (#23): a memory-wedged box slows teardown so reconnect
+# churn outpaces the sweeps and live stdio helpers pile up (~50 on the
+# wedged VM, each with its own descendant tree). New stdio connects defer
+# past this many LIVE helper processes; the next register pass retries
+# them once the herd thins. HTTP servers spawn no processes and never count.
+_MAX_LIVE_HELPERS_KEY = "max_live_helpers"  # config.yaml mcp.<key>
+_MAX_LIVE_HELPERS_DEFAULT = 32
+
+
+def max_live_helpers() -> int:
+    """Configured cap on concurrently-live stdio helper processes (config.yaml
+    ``mcp.max_live_helpers``; default 32, floor 1)."""
+    from hermes_cli.config import load_config
+
+    raw = (load_config().get("mcp") or {}).get(_MAX_LIVE_HELPERS_KEY)
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("MCP: ignoring non-integer mcp.%s=%r", _MAX_LIVE_HELPERS_KEY, raw)
+        else:
+            return max(1, value)
+    return _MAX_LIVE_HELPERS_DEFAULT
+
+
+def live_stdio_helper_count() -> int:
+    """How many stdio helper processes are actually alive right now: tracked children
+    plus orphaned-but-alive ones (the sweep may not have reaped them yet)."""
+    from gateway.status import _pid_exists  # ``os.kill(pid, 0)`` is NOT a no-op on Windows
+
+    with _core._lock:
+        pids = list(_stdio_pids) + list(_orphan_stdio_pids)
+    return sum(1 for pid in pids if _pid_exists(pid))
 _orphan_stdio_pid_servers: dict[int, str] = {}
 # pid -> pgid captured at spawn. The SDK spawns with start_new_session=True (PGID == PID);
 # grandchildren keep that PGID after the direct child exits, so killpg still reaches them.

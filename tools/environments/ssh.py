@@ -397,7 +397,7 @@ class SSHEnvironment(BaseEnvironment):
     def cleanup(self):
         if self._sync_manager:
             logger.info("SSH: syncing files from sandbox...")
-            self._sync_manager.sync_back()
+            self._sync_manager.sync_back_bounded()
         for socket in self._control_sockets():
             if not socket.exists():
                 continue

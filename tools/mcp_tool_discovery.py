@@ -361,6 +361,11 @@ def _select_new_servers(servers: dict[str, dict]) -> dict[str, dict]:
     """Pick connect candidates (enabled, not connected/connecting/lazy, not in backoff) and
     refresh per-server bookkeeping. Known servers without a live session are parked or
     mid-reconnect with tools deregistered, so nothing else can nudge them: signal a reconnect."""
+    # Helper fan-out cap (#23), counted BEFORE the lock (the count takes it too):
+    # defer NEW stdio connects while too many helper processes are live, so a wedged box's
+    # churn cannot outpace the orphan sweeps. Deferred names are simply not candidates this
+    # round — the next register pass retries them once the herd thins.
+    helper_budget = _lifecycle.max_live_helpers() - _lifecycle.live_stdio_helper_count()
     with _core._lock:
         current_scope = _core._mcp_registry_scope()
         # This scope's own connections OR shared ones it adopted (``register_connected_into_current_scope``
@@ -375,6 +380,17 @@ def _select_new_servers(servers: dict[str, dict]) -> dict[str, dict]:
             if keys[k] not in _core._servers and keys[k] not in _core._server_connecting
             and keys[k] not in _core._lazy_server_configs
             and mcp_server_enabled(v) and not _connect_cooldown_active(k)}
+        stdio_pending = [k for k, v in new_servers.items() if "url" not in v]
+        if helper_budget < len(stdio_pending):
+            # Fan-out cap: keep at most `helper_budget` of the new stdio candidates (HTTP
+            # servers spawn no processes). Deferred names stay out of _server_connecting, so
+            # the next register pass naturally retries them.
+            for k in stdio_pending[max(0, helper_budget):]:
+                new_servers.pop(k)
+            logger.warning(
+                "MCP: live stdio helpers at/over the cap (%d) — deferring %d new stdio connect(s) "
+                "until the sweeps thin the herd", _lifecycle.max_live_helpers(),
+                len(stdio_pending) - max(0, helper_budget))
         stale_cached = [_core._servers[keys[k]] for k, v in servers.items()
                         if keys[k] in _core._servers and mcp_server_enabled(v)
                         and getattr(_core._servers[keys[k]], "session", None) is None]

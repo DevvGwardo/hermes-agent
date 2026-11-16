@@ -448,6 +448,20 @@ class TestSyncBackWindowsHost:
         assert (tmp_path / "host" / "new.md").read_bytes() == b"new"  # _infer_host_path parent match
 
 
+def _symlinks_available() -> bool:
+    """Windows needs SeCreateSymbolicLinkPrivilege (or dev-mode) for os.symlink."""
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "t"
+        target.write_bytes(b"x")
+        try:
+            (Path(d) / "l").symlink_to(target)
+        except (OSError, NotImplementedError):
+            return False
+        return True
+
+
+@pytest.mark.skipif(not _symlinks_available(),
+                    reason="os.symlink needs a privilege Windows lacks without dev-mode")
 class TestSyncBackHermesHomePolicy:
     """A sandbox can write its copy of ~/.hermes; sync-back must not turn that into persistent
     host state. Skills (unscanned, loaded by every later session), host-canonical caches and
