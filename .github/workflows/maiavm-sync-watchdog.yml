@@ -11,7 +11,9 @@ name: maiavm sync watchdog
 
 on:
   schedule:
-    - cron: '43 7 * * *'
+    # 2026-11-16: jittered + file touched to re-register the schedule (see
+    # the upstream-sync note: both fork crons were dead since 2026-11-05).
+    - cron: '49 7 * * *'
   workflow_dispatch:
 
 permissions:
