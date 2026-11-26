@@ -107,6 +107,10 @@ class RunBuffer:
 
     __slots__ = (
         "run_id",
+        "session_id",
+        "parent_session_id",
+        "parent_run_id",
+        "source",
         "events",
         "_next_id",
         "completed",
@@ -126,10 +130,26 @@ class RunBuffer:
         "_approval_requested_at",
         "_stopping",
         "_prompt_broker",
+        "_control_revision",
     )
 
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
+        # Chat session this run belongs to. Every dashboard turn carries one
+        # (an explicit ``session_id`` or the run id); it keys the goal /
+        # session-control surface and lets a control change reach every live
+        # SSE consumer of that session (``session.control.update``).
+        self.session_id: Optional[str] = None
+        # Set when the run was launched as a child (``source="subagent"``):
+        # the owning session's id, so clients can show the delegation tree.
+        self.parent_session_id: Optional[str] = None
+        # Parent run id when the caller names one (the platform's direct
+        # subagent surface sends ``parent_run_id`` rather than a session id).
+        self.parent_run_id: Optional[str] = None
+        self.source: Optional[str] = None
+        # Revision of the last ``session.control.update`` appended to this
+        # buffer; a snapshot equal to it is not streamed again.
+        self._control_revision: str = ""
         self.events: List[Dict[str, Any]] = []
         self._next_id: int = 1
         self.completed: bool = False
@@ -372,6 +392,10 @@ class RunBuffer:
         """
         return {
             "run_id": self.run_id,
+            "session_id": self.session_id,
+            "parent_session_id": self.parent_session_id,
+            "parent_run_id": self.parent_run_id,
+            "source": self.source,
             "status": (
                 "completed" if self.completed
                 else "cancelled" if self.cancelled
@@ -409,6 +433,19 @@ class RunBufferRegistry:
         self._buffers: Dict[str, RunBuffer] = {}
         self._lock = asyncio.Lock()
         self._sweeper_task: Optional[asyncio.Task] = None
+        self._control_publish_lock: Optional[asyncio.Lock] = None
+
+    def control_publish_lock(self) -> asyncio.Lock:
+        """Serializes ``session.control.update`` snapshot-then-append publishes.
+
+        Created lazily: an ``asyncio.Lock`` built before the gateway loop exists
+        binds on first use, and a second loop (tests, a restarted adapter)
+        would then raise. Publishes are short (one state read + an in-memory
+        append), so one lock across sessions costs nothing on the hot path.
+        """
+        if self._control_publish_lock is None:
+            self._control_publish_lock = asyncio.Lock()
+        return self._control_publish_lock
 
     async def create(self, run_id: str) -> RunBuffer:
         async with self._lock:
@@ -424,6 +461,32 @@ class RunBufferRegistry:
 
     def get(self, run_id: str) -> Optional[RunBuffer]:
         return self._buffers.get(run_id)
+
+    def for_session(self, session_id: str) -> List[RunBuffer]:
+        """Every buffer (live or still in its grace window) for one chat session."""
+        if not session_id:
+            return []
+        return [b for b in list(self._buffers.values()) if b.session_id == session_id]
+
+    def for_parent(self, parent_session_id: str) -> List[RunBuffer]:
+        """Every run launched as a child of one chat session."""
+        if not parent_session_id:
+            return []
+        return [
+            b for b in list(self._buffers.values())
+            if b.parent_session_id == parent_session_id
+        ]
+
+    def subagents(self, session_id: Optional[str] = None) -> List[RunBuffer]:
+        """Direct child runs, oldest first; ``session_id`` is the parent chat."""
+        return sorted(
+            (
+                b for b in list(self._buffers.values())
+                if b.source == "subagent"
+                and (not session_id or b.parent_session_id == session_id)
+            ),
+            key=lambda b: b.created_at,
+        )
 
     async def list_active(self) -> List[str]:
         return [rid for rid, b in self._buffers.items() if not b.terminal]

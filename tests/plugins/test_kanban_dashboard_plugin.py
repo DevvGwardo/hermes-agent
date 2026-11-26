@@ -484,6 +484,165 @@ def test_dispatch_dry_run(client):
     assert isinstance(body, dict)
 
 # ---------------------------------------------------------------------------
+# POST /swarm (Kanban Swarm v1 topology + one dispatch nudge)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def swarm_dispatch(client, monkeypatch):
+    """Capture the swarm endpoint's dispatcher nudge instead of spawning workers."""
+    plugin_mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    calls = []
+
+    def fake_dispatch_once(conn, **kwargs):
+        calls.append(kwargs)
+        return {"spawned": 0, "already_running": 0}
+
+    monkeypatch.setattr(plugin_mod.kbd, "dispatch_once", fake_dispatch_once)
+    return calls
+
+def test_create_task_forwards_branch_name_for_worktree(client):
+    """POST /tasks must forward branch_name into kanban_db create (worktree cards)."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Shared branch card",
+            "assignee": "researcher",
+            "workspace_kind": "worktree",
+            "branch_name": "swarm/shared-feature",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["branch_name"] == "swarm/shared-feature"
+
+    conn = kbc.connect()
+    try:
+        stored = kb.get_task(conn, task["id"])
+    finally:
+        conn.close()
+    assert stored is not None and stored.branch_name == "swarm/shared-feature"
+
+def test_create_task_refuses_branch_name_without_worktree(client):
+    """The domain layer owns the pairing rule; the API surfaces its 400."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad pairing", "branch_name": "swarm/x"},
+    )
+    assert r.status_code == 400
+    assert "branch_name is only valid for worktree workspaces" in r.json()["detail"]
+
+def test_swarm_creates_graph_and_nudges_dispatch(client, swarm_dispatch):
+    r = client.post(
+        "/api/plugins/kanban/swarm",
+        json={"goal": "Ship the release notes", "workers": 2},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["board"] == kb.DEFAULT_BOARD
+    assert len(body["worker_ids"]) == 2
+    assert body["dispatch"] == {"spawned": 0, "already_running": 0}
+    # Exactly one nudge, scoped to the same board as the graph write.
+    assert len(swarm_dispatch) == 1
+    assert swarm_dispatch[0]["board"] == kb.DEFAULT_BOARD
+
+    conn = kbc.connect()
+    try:
+        root = kb.get_task(conn, body["root_id"])
+        workers = [kb.get_task(conn, tid) for tid in body["worker_ids"]]
+        assert root is not None and root.status == "done"
+        assert all(w is not None and w.status == "ready" for w in workers)
+        assert all(w.assignee == "default" for w in workers)
+        assert set(kb.parent_ids(conn, body["verifier_id"])) == set(body["worker_ids"])
+        assert kb.parent_ids(conn, body["synthesizer_id"]) == [body["verifier_id"]]
+        key = conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (body["root_id"],)
+        ).fetchone()["idempotency_key"]
+        assert key.startswith("swarm:")
+    finally:
+        conn.close()
+
+def test_swarm_is_idempotent_for_the_same_goal(client, swarm_dispatch):
+    first = client.post(
+        "/api/plugins/kanban/swarm", json={"goal": "Map the market", "workers": 2}
+    ).json()
+    second = client.post(
+        "/api/plugins/kanban/swarm", json={"goal": "  map   the MARKET ", "workers": 2}
+    ).json()
+
+    assert second["root_id"] == first["root_id"]
+    assert second["worker_ids"] == first["worker_ids"]
+    assert second["verifier_id"] == first["verifier_id"]
+    assert second["synthesizer_id"] == first["synthesizer_id"]
+
+    conn = kbc.connect()
+    try:
+        # root + 2 workers + verifier + synthesizer; the retry added nothing.
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 5
+    finally:
+        conn.close()
+
+def test_swarm_explicit_idempotency_key_wins(client, swarm_dispatch):
+    first = client.post(
+        "/api/plugins/kanban/swarm",
+        json={"goal": "Goal A", "workers": 1, "idempotency_key": "run-42"},
+    ).json()
+    second = client.post(
+        "/api/plugins/kanban/swarm",
+        json={"goal": "A different goal", "workers": 1, "idempotency_key": "run-42"},
+    ).json()
+    assert second["root_id"] == first["root_id"]
+
+def test_swarm_board_body_pins_the_graph_to_that_board(client, swarm_dispatch):
+    kb.create_board("swarm-board")
+    r = client.post(
+        "/api/plugins/kanban/swarm",
+        json={"goal": "Board-scoped swarm", "workers": 1, "board": "swarm-board"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["board"] == "swarm-board"
+    assert swarm_dispatch[0]["board"] == "swarm-board"
+
+    conn = kbc.connect(board="swarm-board")
+    try:
+        assert kb.get_task(conn, body["root_id"]) is not None
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 4
+    finally:
+        conn.close()
+
+    # The active/default board stayed untouched (no process-global pin leak).
+    conn = kbc.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+def test_swarm_defaults_to_three_workers(client, swarm_dispatch):
+    body = client.post(
+        "/api/plugins/kanban/swarm", json={"goal": "Default worker count"}
+    ).json()
+    assert len(body["worker_ids"]) == 3
+
+def test_swarm_unknown_board_404(client, swarm_dispatch):
+    r = client.post(
+        "/api/plugins/kanban/swarm",
+        json={"goal": "nowhere", "board": "no-such-board"},
+    )
+    assert r.status_code == 404
+
+def test_swarm_empty_goal_400(client, swarm_dispatch):
+    r = client.post("/api/plugins/kanban/swarm", json={"goal": "   "})
+    assert r.status_code == 400
+    assert "goal is required" in r.json()["detail"]
+
+@pytest.mark.parametrize("workers", [0, 13])
+def test_swarm_worker_count_is_bounded(client, swarm_dispatch, workers):
+    r = client.post(
+        "/api/plugins/kanban/swarm", json={"goal": "bounded", "workers": workers}
+    )
+    assert r.status_code == 422
+
+# ---------------------------------------------------------------------------
 # Triage column (new v1 status)
 # ---------------------------------------------------------------------------
 

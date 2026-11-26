@@ -10,6 +10,7 @@ dispatcher's write txns); it carries its credential in the query string (browser
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
@@ -29,6 +30,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
 from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
@@ -419,6 +421,7 @@ class CreateTaskBody(BaseModel):
     priority: int = 0
     workspace_kind: Optional[str] = None  # None = scratch, or the board project's worktree when scoped
     workspace_path: Optional[str] = None
+    branch_name: Optional[str] = None  # worktree workspaces only (kanban_db validates the pairing)
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -1275,6 +1278,98 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:
             return {"result": str(result)}
+
+
+# --- POST /swarm ------------------------------------------------------------
+# Kanban Swarm v1 (``hermes_cli.kanban_swarm``) writes one small durable task graph:
+# a completed planning root (also the shared blackboard) -> N parallel workers ->
+# a verifier -> a synthesizer. The CLI takes explicit ``--worker profile:title``
+# specs; the API only has a goal, so the worker cards are derived from it here and
+# every card goes to the active profile. Graph creation is idempotent: a repeat
+# POST with the same goal (or ``idempotency_key``) returns the existing swarm
+# instead of duplicating it, and the dispatcher is nudged once so workers start
+# without waiting out the 60 s tick.
+
+SWARM_DEFAULT_WORKERS = 3
+SWARM_MAX_WORKERS = 12
+
+
+class SwarmBody(BaseModel):
+    goal: str
+    workers: int = Field(SWARM_DEFAULT_WORKERS, ge=1, le=SWARM_MAX_WORKERS)
+    board: Optional[str] = None  # body-scoped like the rest of the swarm contract
+    idempotency_key: Optional[str] = None  # omit for a goal-derived stable key
+
+
+def _swarm_idempotency_key(goal: str) -> str:
+    """Stable key for a goal so an agent retrying a POST cannot duplicate the swarm."""
+    digest = hashlib.sha256(" ".join(goal.lower().split()).encode("utf-8")).hexdigest()
+    return f"swarm:{digest[:16]}"
+
+
+def _swarm_worker_specs(goal: str, count: int, profile: str) -> list[ks.SwarmWorkerSpec]:
+    """Derive ``count`` parallel worker cards from a bare goal (distinct slices, no LLM call)."""
+    headline = (goal.strip().splitlines()[0] if goal.strip() else goal).strip()[:80]
+    return [
+        ks.SwarmWorkerSpec(
+            profile=profile,
+            title=f"Swarm worker {i}/{count}: {headline}",
+            body=(
+                f"Work one independent slice of this swarm goal:\n\n{goal}\n\n"
+                f"You are worker {i} of {count}: take a distinct angle from your siblings, "
+                "post cross-worker facts on the swarm root blackboard and put "
+                "machine-readable results in your completion metadata."
+            ),
+        )
+        for i in range(1, count + 1)
+    ]
+
+
+def _dispatch_nudge(conn: sqlite3.Connection, board: Optional[str]) -> dict[str, Any]:
+    """Best-effort dispatcher kick after a write; a nudge failure must not fail the write."""
+    try:
+        result = kbd.dispatch_once(conn, board=board)
+    except Exception as exc:
+        log.warning("kanban swarm dispatch nudge failed: %s", exc)
+        return {"error": str(exc)}
+    if isinstance(result, dict):
+        return result
+    try:
+        return asdict(result)  # DispatchResult is a dataclass
+    except TypeError:
+        return {"result": str(result)}
+
+
+@router.post("/swarm")
+def create_swarm_endpoint(payload: SwarmBody):
+    """Create a swarm for ``payload.goal`` on ``payload.board`` and nudge dispatch once.
+
+    ``board`` pins the graph context-locally (never via the process-global
+    ``HERMES_KANBAN_BOARD``) so a concurrent request for another board can't
+    cross-write. Returns the root/worker/verifier/synthesizer ids plus the nudge.
+    """
+    with _errors_to_500("swarm creation failed"):
+        board = _resolve_board(payload.board) or kanban_db.get_current_board()
+        with closing(_conn(board=board)) as conn, _value_error_400():
+            profile = _active_profile_name()
+
+            def _create() -> dict[str, Any]:
+                created = ks.create_swarm(
+                    conn,
+                    goal=payload.goal,
+                    workers=_swarm_worker_specs(payload.goal, payload.workers, profile),
+                    verifier_assignee=profile,
+                    synthesizer_assignee=profile,
+                    created_by=profile,
+                    idempotency_key=(payload.idempotency_key or "").strip()
+                    or _swarm_idempotency_key(payload.goal),
+                )
+                body = created.as_dict()
+                body["board"] = board
+                body["dispatch"] = _dispatch_nudge(conn, board)
+                return body
+
+            return _with_board_pinned(board, _create)
 
 
 @router.get("/model-options")

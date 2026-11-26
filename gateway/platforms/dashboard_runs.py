@@ -41,6 +41,50 @@ Endpoints (registered by the install-runs-overlay patch in api_server.py):
     Explicit cancel. Calls ``agent.interrupt()`` and cancels the
     asyncio task.
 
+- GET  /v1/dashboard/sessions/{session_id}/control
+- POST /v1/dashboard/sessions/{session_id}/control
+    The goal card's REST surface. ``GET`` returns
+    ``{"session_id", "control": {goal, loop, heartbeat, revision,
+    updated_at}}``; ``POST`` accepts
+    ``{"action": ..., "args": {"text"?, "index"?}}`` with ``goal.set``
+    (``args.text`` or ``goal``/``text``, optional ``max_turns``),
+    ``goal.pause``, ``goal.resume``, ``goal.clear``, ``goal.status``,
+    ``subgoal.add`` (``args.text``), ``subgoal.remove``
+    (``args.index``, 1-based) or ``subgoal.clear`` and answers the same
+    envelope. ``goal.gate*`` is refused: a gate runs a shell command on
+    the VM and stays behind the typed /goal slash command. Every
+    mutating action appends ``session.control.update`` to each live run
+    of that session.
+
+- GET /v1/dashboard/sessions/{session_id}/subagents
+    Runs started with ``parent_session_id=<session_id>`` (a dashboard
+    delegation child), newest last. Each entry is the run snapshot.
+
+- POST /v1/dashboard/subagents
+- GET  /v1/dashboard/subagents[?session_id=…]
+- GET  /v1/dashboard/subagents/{run_id}
+- POST /v1/dashboard/subagents/{run_id}/stop
+- POST /v1/dashboard/subagents/{run_id}/steer
+    The direct child-run surface hermes-deploy's ``/api/chat/subagents``
+    proxy calls. ``POST`` takes ``{session_id?, goal, parent_run_id?,
+    context?}``, where ``session_id`` is the parent chat, and starts a
+    ``source="subagent"`` run in its own ``subagent:<uuid>`` session,
+    answering ``run_id`` + ``child_session_id``; ``GET`` lists the tracked
+    child runs (optionally for one parent session) or one run's snapshot.
+    Stop/steer are the same handlers as ``/runs/{id}/...``.
+
+- POST /v1/dashboard/runs (``source`` / ``parent_session_id``)
+    ``source`` may be ``user``, ``dashboard`` or ``subagent``. A
+    ``subagent`` run defaults its own ``session_id`` to
+    ``subagent:<uuid>`` and never drives the parent's goal loop.
+
+The dashboard run loop also advances an active goal: after each turn it
+calls ``GoalManager(session_id).evaluate_after_turn(...)``, streams
+``session.control.update`` and, while the goal stays active, runs the
+continuation prompt as another turn on the same agent (bounded by
+``HERMES_DASHBOARD_GOAL_MAX_CONTINUATIONS``, default 8, and by the goal's
+own ``max_turns``).
+
 Authentication: same Bearer token as the rest of /v1/* — uses the
 adapter's ``_check_auth`` helper.
 """
@@ -123,6 +167,331 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+# ── Session-control surface (goals) ───────────────────────────────────
+#
+# The dashboard app's goal card talks to these two routes instead of the
+# gateway's websocket ``session.control`` RPC: the run transport is plain
+# HTTP + SSE. Only the goal actions the card renders are accepted; quality
+# gates stay behind the typed /goal slash command because a gate runs a
+# shell command on the VM.
+
+_CONTROL_ACTIONS = frozenset({
+    "goal.set", "goal.pause", "goal.resume", "goal.clear", "goal.status",
+    # The same card also hosts the subgoal list; the platform relay forwards
+    # ``{action, args: {text | index}}`` verbatim.
+    "subgoal.add", "subgoal.remove", "subgoal.clear",
+})
+# Anything under this prefix answers 400 instead of 404 so a client built
+# against the full websocket action set sees an explicit refusal.
+_REFUSED_CONTROL_PREFIX = "goal.gate"
+_CONTROL_MAX_SESSION_ID = 256
+_CONTROL_MAX_GOAL_CHARS = 8_000
+_CONTROL_MAX_SUBGOAL_CHARS = 2_000
+_CONTROL_MAX_TURNS = 10_000
+
+# Sources a dashboard run may declare. ``subagent`` marks a child run: it is
+# recorded with ``parent_session_id`` and never drives its own goal loop.
+_DASHBOARD_SOURCES = frozenset({"user", "dashboard", "subagent"})
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# Hard cap on goal continuations inside one dashboard run. GoalManager's own
+# ``max_turns`` budget pauses the loop first in normal use; this only bounds a
+# judge that keeps returning CONTINUE against a broken state row.
+_MAX_GOAL_CONTINUATIONS = max(1, _env_int("HERMES_DASHBOARD_GOAL_MAX_CONTINUATIONS", 8))
+
+
+class _ControlError(Exception):
+    """A refused control action, answered as the OpenAI-style error envelope."""
+
+    def __init__(self, message: str, *, code: str = "invalid_request_error", status: int = 400) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.status = status
+
+
+def _valid_session_id(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value or len(value) > _CONTROL_MAX_SESSION_ID:
+        return None
+    return value
+
+
+def _goal_state_snapshot(state: Any) -> Optional[Dict[str, Any]]:
+    """Frontend-safe GoalState view (same shape the Desktop card uses)."""
+    if state is None or getattr(state, "status", "cleared") == "cleared":
+        return None
+    contract = getattr(state, "contract", None)
+    snapshot: Dict[str, Any] = {
+        "title": state.goal,
+        "status": state.status,
+        "turns_used": state.turns_used,
+        "max_turns": state.max_turns,
+        "contract": contract.to_dict() if contract is not None and hasattr(contract, "to_dict") else {},
+        "subgoals": list(getattr(state, "subgoals", None) or []),
+        "gates": [
+            {
+                "command": gate.command,
+                "timeout_seconds": gate.timeout_seconds,
+                "max_retries": gate.max_retries,
+                "attempts": gate.attempts,
+                "last_exit_code": gate.last_exit_code,
+            }
+            for gate in (getattr(state, "gates", None) or [])
+        ],
+    }
+    if state.created_at:
+        snapshot["created_at"] = state.created_at
+    if state.last_turn_at:
+        snapshot["updated_at"] = state.last_turn_at
+    if state.paused_reason:
+        snapshot["paused_reason"] = state.paused_reason
+    if state.last_verdict:
+        snapshot["last_verdict"] = state.last_verdict
+    if state.last_reason:
+        snapshot["last_reason"] = state.last_reason
+    if state.waiting_until and time.time() < state.waiting_until:
+        snapshot["wait_barrier"] = {
+            "type": "until", "until_at": state.waiting_until,
+            "reason": state.waiting_reason or "",
+        }
+    elif state.waiting_on_session is not None:
+        snapshot["wait_barrier"] = {
+            "type": "session", "target": state.waiting_on_session,
+            "reason": state.waiting_reason or "",
+        }
+    elif state.waiting_on_pid is not None:
+        snapshot["wait_barrier"] = {
+            "type": "pid", "target": state.waiting_on_pid,
+            "reason": state.waiting_reason or "",
+        }
+    return snapshot
+
+
+def _load_control_states(session_id: str) -> tuple[Any, Any, Any]:
+    """Best-effort (goal, loop, heartbeat) rows; a missing manager module is None."""
+    from hermes_cli.goals import load_goal
+
+    goal_state = load_goal(session_id)
+    loop_state = heartbeat_state = None
+    try:
+        from hermes_cli.loops import load_loop
+
+        loop_state = load_loop(session_id)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.heartbeat import load_heartbeat
+
+        heartbeat_state = load_heartbeat(session_id)
+    except Exception:
+        pass
+    return goal_state, loop_state, heartbeat_state
+
+
+def _loop_state_snapshot(state: Any, *, deferred_by_goal: bool) -> Optional[Dict[str, Any]]:
+    if state is None or getattr(state, "status", "cleared") == "cleared":
+        return None
+    snapshot = {
+        "prompt": state.prompt,
+        "status": state.status,
+        "mode": state.mode,
+        "interval_seconds": state.interval_seconds,
+        "current_delay": state.current_delay,
+        "times": state.times,
+        "until": state.until,
+        "max_ticks": state.max_ticks,
+        "ticks_fired": state.ticks_fired,
+        "created_at": state.created_at,
+        "last_fired_at": state.last_fired_at,
+        "next_due_at": state.next_due_at,
+        "awaiting_response": state.awaiting_response,
+        "deferred_by_goal": deferred_by_goal,
+    }
+    if state.paused_reason:
+        snapshot["paused_reason"] = state.paused_reason
+    if state.last_stop_reason:
+        snapshot["last_stop_reason"] = state.last_stop_reason
+    return snapshot
+
+
+def _heartbeat_state_snapshot(state: Any) -> Optional[Dict[str, Any]]:
+    if state is None or getattr(state, "status", "cleared") == "cleared":
+        return None
+    return {
+        "prompt": state.prompt,
+        "status": state.status,
+        "interval_seconds": state.interval_seconds,
+        "created_at": state.created_at,
+        "last_fired_at": state.last_fired_at,
+        "fire_count": state.fire_count,
+    }
+
+
+def _session_control_snapshot(session_id: str, *, manager: Any = None) -> Dict[str, Any]:
+    """Stable goal / loop / heartbeat view for one session.
+
+    ``manager`` is an already-loaded ``GoalManager`` whose in-memory state is
+    newer than the DB row (the post-turn judge and a just-applied action), so
+    only loop/heartbeat are read back in that case.
+    """
+    if manager is not None:
+        goal_state = manager.state
+        _, loop_state, heartbeat_state = _load_control_states(session_id)
+    else:
+        goal_state, loop_state, heartbeat_state = _load_control_states(session_id)
+    goal = _goal_state_snapshot(goal_state)
+    deferred = bool(goal and goal["status"] == "active" and not goal.get("wait_barrier"))
+    loop = _loop_state_snapshot(
+        loop_state,
+        deferred_by_goal=bool(deferred and loop_state is not None and loop_state.status == "active"),
+    )
+    heartbeat = _heartbeat_state_snapshot(heartbeat_state)
+    canonical = json.dumps(
+        {"goal": goal, "loop": loop, "heartbeat": heartbeat},
+        ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    )
+    return {
+        "goal": goal,
+        "loop": loop,
+        "heartbeat": heartbeat,
+        "revision": hashlib.sha256(canonical.encode("utf-8")).hexdigest() if (goal or loop or heartbeat) else "",
+        "updated_at": max(
+            [v for state, fields in (
+                (goal_state, ("created_at", "last_turn_at")),
+                (loop_state, ("created_at", "last_fired_at")),
+                (heartbeat_state, ("created_at", "last_fired_at")),
+            ) if state is not None for field in fields if (v := getattr(state, field, 0))] or [0]
+        ),
+    }
+
+
+def _apply_control_action(session_id: str, action: str, body: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+    """Apply one goal/subgoal action through GoalManager; returns (snapshot, status line)."""
+    from hermes_cli.goals import GoalManager
+
+    # The platform relay sends ``{action, args: {text?, index?}}``; accept the
+    # flat fields too so a direct caller can post them.
+    raw_args = body.get("args")
+    args: Dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+
+    manager = GoalManager(session_id=session_id)
+    if action == "goal.set":
+        raw_goal = args.get("text", body.get("goal", body.get("text", body.get("input"))))
+        if not isinstance(raw_goal, str) or not raw_goal.strip():
+            raise _ControlError("'goal' must be a non-empty string", code="invalid_goal")
+        if len(raw_goal) > _CONTROL_MAX_GOAL_CHARS:
+            raise _ControlError(
+                f"'goal' is too long (max {_CONTROL_MAX_GOAL_CHARS} characters)",
+                code="invalid_goal",
+            )
+        raw_max = body.get("max_turns")
+        if raw_max is not None:
+            if isinstance(raw_max, bool) or not isinstance(raw_max, int) or not 1 <= raw_max <= _CONTROL_MAX_TURNS:
+                raise _ControlError(
+                    f"'max_turns' must be an integer between 1 and {_CONTROL_MAX_TURNS}",
+                    code="invalid_max_turns",
+                )
+        manager.set(raw_goal.strip(), max_turns=raw_max)
+    elif action == "goal.pause":
+        if not manager.has_goal() or manager.pause() is None:
+            raise _ControlError("No goal to pause", code="goal_not_active", status=409)
+    elif action == "goal.resume":
+        if not manager.has_goal() or manager.resume() is None:
+            raise _ControlError("No goal to resume", code="goal_not_active", status=409)
+    elif action == "goal.clear":
+        manager.clear()
+    elif action == "subgoal.add":
+        text = args.get("text", body.get("text"))
+        if not isinstance(text, str) or not text.strip() or len(text) > _CONTROL_MAX_SUBGOAL_CHARS:
+            raise _ControlError(
+                f"'text' must be a non-empty string (max {_CONTROL_MAX_SUBGOAL_CHARS} characters)",
+                code="invalid_subgoal",
+            )
+        try:
+            manager.add_subgoal(text.strip())
+        except RuntimeError as exc:
+            raise _ControlError("No active goal", code="goal_not_active", status=409) from exc
+    elif action == "subgoal.remove":
+        index = args.get("index", body.get("index"))
+        if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+            raise _ControlError("'index' must be a 1-based integer", code="invalid_subgoal_index")
+        try:
+            manager.remove_subgoal(index)
+        except RuntimeError as exc:
+            raise _ControlError("No active goal", code="goal_not_active", status=409) from exc
+        except IndexError as exc:
+            raise _ControlError(str(exc), code="invalid_subgoal_index") from exc
+    elif action == "subgoal.clear":
+        try:
+            manager.clear_subgoals()
+        except RuntimeError as exc:
+            raise _ControlError("No active goal", code="goal_not_active", status=409) from exc
+    # goal.status is a read: no mutation, and the caller does not publish.
+    return _session_control_snapshot(session_id, manager=manager), manager.status_line()
+
+
+async def _publish_session_control(
+    registry: RunBufferRegistry,
+    session_id: str,
+) -> None:
+    """Append ``session.control.update`` to every live run of a session.
+
+    Reads the persisted state under the publish lock, then appends: a snapshot
+    taken before a newer one must never be appended after it (an SSE client
+    keeps the last frame it saw, so a stale "active" would paint over a
+    just-paused goal).
+    """
+    async with registry.control_publish_lock():
+        try:
+            control = await asyncio.to_thread(_session_control_snapshot, session_id)
+        except Exception:
+            logger.debug("[dashboard_runs] control snapshot failed for %s", session_id, exc_info=True)
+            return
+        revision = control.get("revision") or ""
+        for buf in registry.for_session(session_id):
+            if buf.terminal or revision == buf._control_revision:
+                continue
+            await buf.append({
+                "event": "session.control.update",
+                "run_id": buf.run_id,
+                "session_id": session_id,
+                "timestamp": time.time(),
+                "control": control,
+            })
+            buf._control_revision = revision
+
+
+def _schedule_session_control(
+    registry: RunBufferRegistry,
+    loop: asyncio.AbstractEventLoop,
+    session_id: str,
+) -> None:
+    """``_publish_session_control`` from the executor thread (post-turn judge)."""
+    async def _publish() -> None:
+        try:
+            # The read happens under the publish lock, so a user action that
+            # landed meanwhile is what gets streamed.
+            await _publish_session_control(registry, session_id)
+        except Exception:
+            logger.debug("[dashboard_runs] control publish failed for %s", session_id, exc_info=True)
+
+    try:
+        loop.call_soon_threadsafe(asyncio.create_task, _publish())
+    except RuntimeError:
+        # Loop closed mid-run — best-effort, same as append_threadsafe.
+        pass
 
 
 def _openai_error(message: str, code: str = "invalid_request_error", status: int = 400) -> Dict[str, Any]:
@@ -361,6 +730,61 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
         body = await request.json()
     except Exception:
         return web.json_response(_openai_error("Invalid JSON"), status=400)
+    return await _start_run(adapter, registry, body, request=request)
+
+
+async def _start_run(
+    adapter: Any,
+    registry: RunBufferRegistry,
+    body: Any,
+    *,
+    request: Optional["web.Request"] = None,
+    default_source: Optional[str] = None,
+) -> "web.Response":
+    """Shared body of ``POST /runs`` and ``POST /subagents`` (already authed)."""
+    if not isinstance(body, dict):
+        return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+    # Delegation lineage. ``source="subagent"`` marks a child run (the dashboard
+    # chat's delegation card starts one); ``parent_session_id`` names the
+    # owning chat session. Both are echoed on run.started and the snapshot so
+    # the client can group the tree; a subagent run never drives a goal loop of
+    # its own (its parent owns the goal).
+    source: Optional[str] = body.get("source")
+    if source is not None:
+        if not isinstance(source, str) or source.strip().lower() not in _DASHBOARD_SOURCES:
+            return web.json_response(
+                _openai_error(
+                    "'source' must be one of: user, dashboard, subagent",
+                    code="invalid_source",
+                ),
+                status=400,
+            )
+        source = source.strip().lower()
+    elif default_source is not None:
+        source = default_source
+    parent_session_id = body.get("parent_session_id")
+    if parent_session_id is not None:
+        if not isinstance(parent_session_id, str) or not parent_session_id.strip() or len(parent_session_id) > _CONTROL_MAX_SESSION_ID:
+            return web.json_response(
+                _openai_error(
+                    f"'parent_session_id' must be a non-empty string (max {_CONTROL_MAX_SESSION_ID} characters)",
+                    code="invalid_parent_session_id",
+                ),
+                status=400,
+            )
+        parent_session_id = parent_session_id.strip()
+    parent_run_id = body.get("parent_run_id")
+    if parent_run_id is not None:
+        if not isinstance(parent_run_id, str) or not parent_run_id.strip() or len(parent_run_id) > _CONTROL_MAX_SESSION_ID:
+            return web.json_response(
+                _openai_error(
+                    f"'parent_run_id' must be a non-empty string (max {_CONTROL_MAX_SESSION_ID} characters)",
+                    code="invalid_parent_run_id",
+                ),
+                status=400,
+            )
+        parent_run_id = parent_run_id.strip()
 
     raw_input = body.get("input")
     if raw_input is None:
@@ -411,12 +835,33 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
                 instructions = stored.get("instructions")
 
     run_id = f"run_{uuid.uuid4().hex}"
-    session_id = body.get("session_id") or stored_session_id or run_id
+    explicit_session_id = body.get("session_id")
+    if explicit_session_id is not None and not isinstance(explicit_session_id, str):
+        return web.json_response(_openai_error("'session_id' must be a string", code="invalid_session_id"), status=400)
+    session_id = (
+        (explicit_session_id or stored_session_id)
+        or (f"subagent:{uuid.uuid4().hex}" if source == "subagent" else run_id)
+    )
+
+    # A child run starts a fresh session per run; it must not share the parent's
+    # goal (the parent's goal judge would then see the child's turn as its own).
+    goal_continuation = (
+        source != "subagent"
+        and _coerce_request_bool(body.get("goal_continuation"), default=True)
+    )
+    # Set by _continue_active_goal once the judge ran; the run wrapper then
+    # publishes the final control state BEFORE the terminal event, so an SSE
+    # client that closes on run.completed still saw the judge's last step.
+    goal_evaluated = False
 
     try:
         buf = await registry.create(run_id)
     except RuntimeError as exc:
         return web.json_response(_openai_error(str(exc), code="rate_limit_exceeded"), status=429)
+    buf.session_id = session_id
+    buf.parent_session_id = parent_session_id
+    buf.parent_run_id = parent_run_id
+    buf.source = source
 
     loop = asyncio.get_running_loop()
 
@@ -428,7 +873,7 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
     if RunPromptBroker is not None and parse_client_capabilities is not None:
         try:
             capabilities = parse_client_capabilities(
-                request.headers.get(CLIENT_CAPABILITIES_HEADER),
+                request.headers.get(CLIENT_CAPABILITIES_HEADER) if request is not None else None,
                 body.get(CLIENT_CAPABILITIES_FIELD),
             )
         except Exception:
@@ -499,6 +944,103 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
             "index": segment_index,
             "timestamp": time.time(),
         })
+
+    def _close_segment_before_goal_continuation() -> None:
+        """One bubble per turn: a goal continuation is a new assistant reply."""
+        nonlocal segment_index, streamed_since_segment
+        if not streamed_since_segment:
+            return
+        segment_index += 1
+        streamed_since_segment = False
+        buf.append_threadsafe(loop, {
+            "event": "message.segment",
+            "run_id": run_id,
+            "index": segment_index,
+            "timestamp": time.time(),
+        })
+
+    def _continue_active_goal(agent: Any, result: Any) -> Any:
+        """Advance an active goal after a dashboard turn, bounded.
+
+        The gateway's post-turn hook re-enqueues the continuation through the
+        adapter FIFO so a simultaneous user message wins. A dashboard run owns
+        its session's turn outright, so the continuation is another
+        ``run_conversation`` on the same agent: the event stream stays one
+        durable run the client can reattach to, and the goal's own
+        ``max_turns`` budget pauses the loop before
+        ``_MAX_GOAL_CONTINUATIONS`` normally matters.
+        """
+        nonlocal goal_evaluated
+        for _ in range(_MAX_GOAL_CONTINUATIONS):
+            if buf._stopping:
+                return result
+            final_text = ""
+            if isinstance(result, dict):
+                if result.get("failed"):
+                    # A failed turn is no evidence for the judge (the gateway's
+                    # post-turn hook skips the goal for the same reason).
+                    return result
+                final_text = str(result.get("final_response") or result.get("error") or "")
+            if not final_text.strip():
+                # A failed/empty turn is no evidence for the judge (gateway
+                # skips the hook for the same reason).
+                return result
+            try:
+                from hermes_cli.goals import (
+                    GoalManager,
+                    count_active_delegations,
+                    gather_background_processes,
+                )
+
+                manager = GoalManager(session_id=session_id)
+                if not manager.is_active():
+                    return result
+                background_processes = None
+                active_delegations = 0
+                try:
+                    background_processes = gather_background_processes(owner_task_id=session_id)
+                except Exception:
+                    background_processes = None
+                try:
+                    active_delegations = count_active_delegations(session_id)
+                except Exception:
+                    active_delegations = 0
+                decision = manager.evaluate_after_turn(
+                    final_text,
+                    user_initiated=True,
+                    background_processes=background_processes,
+                    active_delegations=active_delegations,
+                )
+                goal_evaluated = True
+            except Exception:
+                logger.exception("[dashboard_runs %s] goal evaluation failed", run_id)
+                return result
+            # The card repaints from the stream, not the reply: the judge has
+            # just moved turns_used / the status. The publish re-reads state
+            # under its lock, so a concurrent user action wins.
+            _schedule_session_control(registry, loop, session_id)
+            prompt = decision.get("continuation_prompt") or ""
+            if not decision.get("should_continue") or not prompt:
+                return result
+            _close_segment_before_goal_continuation()
+            buf.append_threadsafe(loop, {
+                "event": "goal.continuation",
+                "run_id": run_id,
+                "session_id": session_id,
+                "timestamp": time.time(),
+                "turn": int(getattr(manager.state, "turns_used", 0) or 0),
+                "reason": _redact_text(str(decision.get("reason") or "")),
+            })
+            result = agent.run_conversation(
+                user_message=prompt,
+                conversation_history=[],
+                task_id="default",
+            )
+        logger.info(
+            "[dashboard_runs %s] goal continuation cap reached (%d)",
+            run_id, _MAX_GOAL_CONTINUATIONS,
+        )
+        return result
 
     def _on_tool_progress(event_type: str, tool_name: Optional[str] = None,
                            preview: Optional[str] = None, args: Any = None,
@@ -608,6 +1150,10 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
             await buf.append({
                 "event": "run.started",
                 "run_id": run_id,
+                "session_id": session_id,
+                "parent_session_id": parent_session_id,
+                "parent_run_id": parent_run_id,
+                "source": source,
             })
             # Clarify is off the api_server toolset for plain clients; a
             # declaring client gets it back (native /v1/runs parity).
@@ -673,6 +1219,10 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
                         conversation_history=history,
                         task_id="default",
                     )
+                    if goal_continuation:
+                        # The judge is a synchronous aux-LLM call; this is the
+                        # executor thread, so it blocks no gateway loop work.
+                        result = _continue_active_goal(agent, result)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -706,6 +1256,14 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
                 # completed with whatever the interrupted agent returned.
                 await buf.mark_cancelled("Stop requested via API")
                 return
+            if goal_continuation and goal_evaluated:
+                # The judge's last state must be on the stream before the
+                # terminal event: an SSE consumer closes at run.completed and
+                # would never read an append that lands after it.
+                try:
+                    await _publish_session_control(registry, session_id)
+                except Exception:
+                    logger.debug("[dashboard_runs %s] final control publish failed", run_id)
             final = ""
             if isinstance(result, dict):
                 final = result.get("final_response") or result.get("error") or ""
@@ -747,6 +1305,9 @@ async def handle_start_run(adapter: Any, registry: RunBufferRegistry, request: "
         "run_id": run_id,
         "status": "started",
         "session_id": session_id,
+        "parent_session_id": parent_session_id,
+        "parent_run_id": parent_run_id,
+        "source": source,
     }, status=202)
 
 
@@ -1161,6 +1722,223 @@ async def handle_run_clarify(adapter: Any, registry: RunBufferRegistry, request:
     return await _handle_run_prompt(adapter, registry, request, "clarify", "answer")
 
 
+async def handle_start_subagent(adapter: Any, registry: RunBufferRegistry, request: "web.Request") -> "web.Response":
+    """POST /v1/dashboard/subagents — start a direct child run.
+
+    Contract used by hermes-deploy's ``/api/chat/subagents`` proxy:
+    ``{session_id?, goal, parent_run_id?, context?}`` -> ``run_id`` +
+    ``child_session_id``. ``session_id`` names the PARENT chat the child
+    belongs to; the child itself always gets a fresh ``subagent:<uuid>``
+    session so its transcript never mixes with the parent's. ``goal`` becomes
+    the first user turn; ``context`` is appended to it (the agent's system
+    prompt is left alone). ``wait`` is accepted for parity but not honoured:
+    the call answers as soon as the run is started, and the caller polls the
+    run snapshot.
+    """
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(_openai_error("Invalid JSON"), status=400)
+    if not isinstance(body, dict):
+        return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+    raw_goal = body.get("goal", body.get("input"))
+    if not isinstance(raw_goal, str) or not raw_goal.strip():
+        return web.json_response(_openai_error("'goal' is required", code="invalid_goal"), status=400)
+    if len(raw_goal) > _CONTROL_MAX_GOAL_CHARS:
+        return web.json_response(
+            _openai_error(f"'goal' is too long (max {_CONTROL_MAX_GOAL_CHARS} characters)", code="invalid_goal"),
+            status=400,
+        )
+    goal = raw_goal.strip()
+
+    session_id = _valid_session_id(body.get("session_id") or "dashboard")
+    if session_id is None:
+        return web.json_response(_openai_error("Invalid session_id", code="invalid_session_id"), status=400)
+    parent_session_id = session_id
+    # A direct subagent gets its OWN session (the platform stores the returned
+    # ``child_session_id`` on the child ChatTurn); the request's session_id is
+    # the parent chat it belongs to.
+    child_session_id = _valid_session_id(body.get("child_session_id")) or f"subagent:{uuid.uuid4().hex}"
+
+    context = body.get("context")
+    if context is not None:
+        if not isinstance(context, str) or len(context) > 12_000:
+            return web.json_response(
+                _openai_error("'context' must be a string (max 12000 characters)", code="invalid_context"),
+                status=400,
+            )
+        if context.strip():
+            goal = f"{goal}\n\nContext:\n{context.strip()}"
+
+    run_body: Dict[str, Any] = {
+        "input": goal,
+        "session_id": child_session_id,
+        "source": "subagent",
+        "goal_continuation": False,
+        "parent_run_id": body.get("parent_run_id"),
+        "parent_session_id": parent_session_id,
+    }
+    if body.get("input_images") is not None:
+        run_body["input_images"] = body.get("input_images")
+
+    response = await _start_run(
+        adapter,
+        registry,
+        run_body,
+        request=request,
+        default_source="subagent",
+    )
+    if response.status != 202:
+        return response
+    try:
+        payload = json.loads(response.body or b"{}")
+    except Exception:
+        payload = {}
+    payload["object"] = "hermes.subagent"
+    payload["child_session_id"] = payload.get("session_id")
+    return web.json_response(payload, status=202)
+
+
+async def handle_list_subagents(adapter: Any, registry: RunBufferRegistry, request: "web.Request") -> "web.Response":
+    """GET /v1/dashboard/subagents?session_id=… — runs the gateway tracks."""
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+
+    raw_session = request.query.get("session_id")
+    session_id = _valid_session_id(raw_session) if raw_session is not None else None
+    if raw_session is not None and session_id is None:
+        return web.json_response(_openai_error("Invalid session_id", code="invalid_session_id"), status=400)
+    return web.json_response([buf.snapshot() for buf in registry.subagents(session_id)])
+
+
+async def handle_subagent_snapshot(adapter: Any, registry: RunBufferRegistry, request: "web.Request") -> "web.Response":
+    """GET /v1/dashboard/subagents/{run_id} — status of one direct child run."""
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+
+    run_id = request.match_info["run_id"]
+    buf = registry.get(run_id)
+    if buf is None or buf.source != "subagent":
+        return web.json_response(
+            _openai_error(f"Subagent run not found: {run_id}", code="subagent_not_found"),
+            status=404,
+        )
+    return web.json_response(buf.snapshot())
+
+
+async def handle_session_control_get(adapter: Any, registry: RunBufferRegistry, request: "web.Request") -> "web.Response":
+    """GET /v1/dashboard/sessions/{session_id}/control — read goal/loop state."""
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+
+    session_id = _valid_session_id(request.match_info.get("session_id"))
+    if session_id is None:
+        return web.json_response(_openai_error("Invalid session_id", code="invalid_session_id"), status=400)
+    try:
+        control = await asyncio.to_thread(_session_control_snapshot, session_id)
+    except Exception as exc:
+        logger.exception("[dashboard_runs] control snapshot failed for %s", session_id)
+        return web.json_response(
+            _openai_error(f"Session control unavailable: {exc}", code="control_unavailable"),
+            status=500,
+        )
+    return web.json_response({
+        "object": "hermes.session.control",
+        "session_id": session_id,
+        "control": control,
+    })
+
+
+async def handle_session_control_post(adapter: Any, registry: RunBufferRegistry, request: "web.Request") -> "web.Response":
+    """POST /v1/dashboard/sessions/{session_id}/control — goal set/pause/resume/clear/status."""
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+
+    session_id = _valid_session_id(request.match_info.get("session_id"))
+    if session_id is None:
+        return web.json_response(_openai_error("Invalid session_id", code="invalid_session_id"), status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(_openai_error("Invalid JSON"), status=400)
+    if not isinstance(body, dict):
+        return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+    raw_action = body.get("action")
+    if not isinstance(raw_action, str) or not raw_action.strip():
+        return web.json_response(
+            _openai_error("'action' is required", code="invalid_control_action"),
+            status=400,
+        )
+    action = raw_action.strip()
+    if action.startswith(_REFUSED_CONTROL_PREFIX):
+        return web.json_response(
+            _openai_error(
+                "Goal gate controls are not available over the dashboard API; use the /goal gate command",
+                code="unsupported_control_action",
+            ),
+            status=400,
+        )
+    if action not in _CONTROL_ACTIONS:
+        return web.json_response(
+            _openai_error(
+                "Unsupported action; expected one of: " + ", ".join(sorted(_CONTROL_ACTIONS)),
+                code="invalid_control_action",
+            ),
+            status=400,
+        )
+
+    try:
+        control, message = await asyncio.to_thread(_apply_control_action, session_id, action, body)
+    except _ControlError as exc:
+        return web.json_response(_openai_error(exc.message, code=exc.code), status=exc.status)
+    except Exception as exc:
+        logger.exception("[dashboard_runs] control action %s failed for %s", action, session_id)
+        return web.json_response(
+            _openai_error(f"Session control unavailable: {exc}", code="control_unavailable"),
+            status=500,
+        )
+
+    # Reads never publish (the Desktop card repaints only on a change). The
+    # publish re-reads under its lock: a judge that landed a newer snapshot
+    # meanwhile is what gets streamed, never this call's older one.
+    if action != "goal.status":
+        await _publish_session_control(registry, session_id)
+    return web.json_response({
+        "object": "hermes.session.control",
+        "session_id": session_id,
+        "action": action,
+        "message": message,
+        "control": control,
+    })
+
+
+async def handle_session_subagents(adapter: Any, registry: RunBufferRegistry, request: "web.Request") -> "web.Response":
+    """GET /v1/dashboard/sessions/{session_id}/subagents — child runs of a session."""
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+
+    session_id = _valid_session_id(request.match_info.get("session_id"))
+    if session_id is None:
+        return web.json_response(_openai_error("Invalid session_id", code="invalid_session_id"), status=400)
+    return web.json_response({
+        "object": "list",
+        "session_id": session_id,
+        "data": [buf.snapshot() for buf in registry.for_parent(session_id)],
+    })
+
+
 def register_routes(app: "web.Application", adapter: Any, registry: RunBufferRegistry) -> None:
     """Wire the dashboard endpoints into the api_server's aiohttp app."""
 
@@ -1191,6 +1969,24 @@ def register_routes(app: "web.Application", adapter: Any, registry: RunBufferReg
     async def _clarify(request: "web.Request") -> "web.Response":
         return await handle_run_clarify(adapter, registry, request)
 
+    async def _control_get(request: "web.Request") -> "web.Response":
+        return await handle_session_control_get(adapter, registry, request)
+
+    async def _control_post(request: "web.Request") -> "web.Response":
+        return await handle_session_control_post(adapter, registry, request)
+
+    async def _subagents(request: "web.Request") -> "web.Response":
+        return await handle_session_subagents(adapter, registry, request)
+
+    async def _subagent_start(request: "web.Request") -> "web.Response":
+        return await handle_start_subagent(adapter, registry, request)
+
+    async def _subagent_list(request: "web.Request") -> "web.Response":
+        return await handle_list_subagents(adapter, registry, request)
+
+    async def _subagent_snapshot(request: "web.Request") -> "web.Response":
+        return await handle_subagent_snapshot(adapter, registry, request)
+
     app.router.add_post("/v1/dashboard/runs", _start)
     app.router.add_get("/v1/dashboard/runs/{run_id}/events", _events)
     app.router.add_get("/v1/dashboard/runs/{run_id}", _snapshot)
@@ -1200,3 +1996,11 @@ def register_routes(app: "web.Application", adapter: Any, registry: RunBufferReg
     app.router.add_post("/v1/dashboard/runs/{run_id}/approval", _approval)
     app.router.add_post("/v1/dashboard/runs/{run_id}/secret", _secret)
     app.router.add_post("/v1/dashboard/runs/{run_id}/clarify", _clarify)
+    app.router.add_post("/v1/dashboard/subagents", _subagent_start)
+    app.router.add_get("/v1/dashboard/subagents", _subagent_list)
+    app.router.add_get("/v1/dashboard/subagents/{run_id}", _subagent_snapshot)
+    app.router.add_post("/v1/dashboard/subagents/{run_id}/stop", _stop)
+    app.router.add_post("/v1/dashboard/subagents/{run_id}/steer", _steer)
+    app.router.add_get("/v1/dashboard/sessions/{session_id}/control", _control_get)
+    app.router.add_post("/v1/dashboard/sessions/{session_id}/control", _control_post)
+    app.router.add_get("/v1/dashboard/sessions/{session_id}/subagents", _subagents)
