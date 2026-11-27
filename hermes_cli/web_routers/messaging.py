@@ -116,12 +116,6 @@ _MESSAGING_ENV_FALLBACKS: dict[str, dict[str, Any]] = {
         ("FEISHU_VERIFICATION_TOKEN", "Feishu / Lark verification token", "Verification token", {"password": True}),
         ("DINGTALK_CLIENT_ID", "DingTalk client ID (App key)", "Client ID", {}),
         ("DINGTALK_CLIENT_SECRET", "DingTalk client secret (App secret)", "Client secret", {"password": True}),
-        # Email extras (the email plugin normally registers these; kept here so the card never
-        # shows a raw key if it didn't load).
-        ("EMAIL_IMAP_PORT", "IMAP server port. Leave blank to use the standard secure port, 993.", "IMAP port", {"advanced": True}),
-        ("EMAIL_SMTP_PORT", "SMTP server port. Leave blank to use the standard port, 587.", "SMTP port", {"advanced": True}),
-        ("EMAIL_ALLOWED_USERS", "Email addresses allowed to talk to the bot, separated by commas", "Allowed email addresses", {}),
-        ("EMAIL_HOME_ADDRESS", "Email address that receives scheduled results and notifications", "Home address", {"advanced": True}),
         ("MATRIX_HOME_ROOM", "Matrix room ID that receives scheduled results and notifications (for example !abc123:matrix.org). Sending /sethome in a room sets this for you.", "Home room", {"advanced": True}),
         *(_allowed_users_row(key, label) for key, label in (
             ("WECOM_CALLBACK_ALLOWED_USERS", "WeCom"), ("WEIXIN_ALLOWED_USERS", "WeChat"),

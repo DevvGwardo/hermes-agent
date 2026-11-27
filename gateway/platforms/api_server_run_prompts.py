@@ -9,13 +9,20 @@ answers, the timeout expires (``<kind>.expire`` event), or the run stops/ends.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+try:
+    from aiohttp import web
+except ImportError:  # pragma: no cover — gateway always has aiohttp
+    web = None  # type: ignore[assignment]
 
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -168,3 +175,117 @@ class RunPromptBroker:
                 if not entry.event.is_set():
                     entry.answer = ""
                     entry.event.set()
+
+
+# -- api_server_runs delegations --------------------------------------------------------
+# The run handlers/helpers below are fork-owned; api_server_runs.py keeps only
+# one-line aliases so upstream syncs never have to merge their bodies. Cross-module
+# names are imported at call time (api_server_runs imports this module at import time).
+
+
+def make_prompt_broker(self: Any, run: Any) -> RunPromptBroker:
+    """Per-run prompt broker whose events/status land on this run's stream (thread-safe)."""
+    from gateway.platforms.api_server_runs import _run_event
+    run_id, loop = run.run_id, asyncio.get_running_loop()
+
+    def _emit(name: str, fields: Dict[str, Any]) -> None:
+        with suppress(Exception):
+            loop.call_soon_threadsafe(run.put_event, _run_event(run_id, name, **fields))
+
+    def _set_pending(summary: Optional[Dict[str, Any]]) -> None:
+        status = self._run_statuses.get(run_id)
+        if status is None:
+            return
+        if summary is None:
+            status.pop("pending_input", None)
+        else:
+            self._set_run_status(run_id, status.get("status", "running"),
+                                 last_event=f"{summary['kind']}.request", pending_input=summary)
+
+    broker = self._run_prompt_brokers[run_id] = RunPromptBroker(run.client_capabilities, _emit, _set_pending)
+    return broker
+
+
+def close_prompt_broker(self: Any, run_id: str) -> None:
+    broker = self._run_prompt_brokers.get(run_id)
+    if broker is not None:
+        broker.close()
+
+
+async def resolve_run_prompt(self: Any, request: Any, kind: str, value_key: str, *, _api_server: Any):
+    """Shared body of POST /v1/runs/{id}/secret and /clarify (API-key auth, owning scope only)."""
+    from gateway.platforms.api_server_runs import _load_owned_run
+    from gateway.platforms.api_server_room_grants import _json_error
+    _openai_error = _api_server._openai_error
+    run_id, _, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission=None, active_fallback=False)
+    if err is not None:
+        return None, err
+    body, err = await self._read_json_body(request)
+    if err:
+        return None, err
+    request_id = body.get("request_id")
+    raw_value = body.get(value_key, "")
+    if isinstance(raw_value, (list, dict)) and kind == "clarify":
+        raw_value = json.dumps(raw_value, ensure_ascii=False)  # multi-select array / whole-batch answers
+    question_id = body.get("question_id") or ""
+    broker = self._run_prompt_brokers.get(run_id)
+    for failed, message, code, status in (
+        (not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 256,
+         f"{kind.capitalize()} request_id is required.", f"invalid_{kind}_request", 400),
+        (raw_value is not None and not isinstance(raw_value, str),
+         f"'{value_key}' must be a string.", f"invalid_{kind}_{value_key}", 400),
+        (not isinstance(question_id, str), "'question_id' must be a string.", f"invalid_{kind}_request", 400),
+        (broker is None or kind not in broker.capabilities,
+         f"Run has no active {kind} prompts: {run_id}", f"{kind}_not_active", 409)):
+        if failed:
+            return None, _json_error(_openai_error, message, code=code, status=status)
+    error, remaining = broker.resolve(kind, request_id.strip(), raw_value or "", question_id)
+    if error == "unknown_question":
+        return None, _json_error(
+            _openai_error, f"Unknown question_id: {question_id}", code="invalid_clarify_question", status=400)
+    if error is not None:
+        return None, _json_error(
+            _openai_error, f"Run has no pending {kind} request {request_id}", code=f"{kind}_not_pending", status=409)
+    result: Dict[str, Any] = {"run_id": run_id, "request_id": request_id.strip()}
+    if kind == "secret":
+        result["skipped"] = not raw_value
+    if remaining is not None:
+        result.update(question_id=question_id, remaining=remaining)
+    return result, None
+
+
+async def handle_run_secret(self: Any, request: Any, *, _api_server: Any) -> Any:
+    """POST /v1/runs/{run_id}/secret — answer a ``secret.request`` ({request_id, value}; empty = skip)."""
+    from gateway.platforms.api_server_runs import _mark_run_event
+    result, err = await resolve_run_prompt(self, request, "secret", "value", _api_server=_api_server)
+    if err is not None:
+        return err
+    # The value itself never leaves the handler: not echoed, logged, or evented.
+    _mark_run_event(self, result["run_id"], "secret.responded",
+                    request_id=result["request_id"], skipped=result["skipped"])
+    return web.json_response({"object": "hermes.run.secret_response", **result})
+
+
+async def handle_run_clarify(self: Any, request: Any, *, _api_server: Any) -> Any:
+    """POST /v1/runs/{run_id}/clarify — answer a ``clarify.request`` ({request_id, answer, question_id?}).
+
+    Authority runs (a canonical session turn another surface owns) answer through the durable
+    admission; a plain API run answers through this run's own prompt broker."""
+    from gateway.platforms.api_server_authority_runs import run_admission
+    from gateway.platforms.api_server_runs import _load_owned_run, _mark_run_event, _respond_authority_run
+    if run_admission(self, request.match_info.get("run_id", "")) is not None:
+        run_id, _, _, _, err = _load_owned_run(
+            self, request, _api_server=_api_server, permission="approve", active_fallback=False)
+        if err is not None:
+            return err
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+        return await _respond_authority_run(self, run_id, body, kind="clarify", _api_server=_api_server)
+    result, err = await resolve_run_prompt(self, request, "clarify", "answer", _api_server=_api_server)
+    if err is not None:
+        return err
+    _mark_run_event(self, result["run_id"], "clarify.responded",
+                    **{k: v for k, v in result.items() if k != "run_id"})
+    return web.json_response({"object": "hermes.run.clarify_response", **result})

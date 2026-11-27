@@ -30,15 +30,20 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --extra messaging
 
       - name: Run fork regression suite
         run: |
-          uv run --with pytest pytest -q \
+          uv run --with pytest --with pytest-asyncio --extra messaging pytest -q \
             tests/test_hermes_constants.py \
+            tests/gateway/test_agent_cache.py \
+            tests/gateway/test_api_server.py \
             tests/gateway/test_api_server_dashboard_runs_native.py \
             tests/gateway/test_api_server_run_prompts.py \
             tests/gateway/test_dashboard_sessions_control.py \
+            tests/hermes_cli/test_config.py \
+            tests/hermes_cli/test_credential_lifecycle.py \
             tests/hermes_cli/test_notifications_bus.py \
+            tests/hermes_cli/test_web_server_messaging_profiles.py \
             tests/hermes_cli/test_web_server_skills_profiles.py \
             tests/tools/test_ssh_environment.py
