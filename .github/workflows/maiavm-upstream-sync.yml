@@ -5,26 +5,20 @@ name: maiavm upstream sync
 # Never pushes to maiavm itself and never contacts the upstream repo beyond a
 # read-only fetch.
 #
-# Design notes (2026-11-04):
-# - Weekly, not daily. Upstream moves thousands of commits a day; a daily merge
-#   candidate is not a reviewable unit and mostly produces churn. Daily polling
-#   would only detect; the integration cadence is a human decision.
-# - One bot-owned branch, `bot/upstream-sync`, updated in place. The old
-#   `sync/upstream-YYYYMMDD` scheme created a new branch and PR every day.
-# - A conflict never touches the open branch/PR: it fails the run, writes the
-#   conflicting files to the job summary, and posts them to Telegram (the ops
-#   bot) or, failing that, a webhook. GitHub Issues are DISABLED on this repo,
-#   so the old `gh issue create` path was a guaranteed silent failure.
-# - The bot refuses to force-push over a branch carrying a human commit, so a
-#   manual conflict resolution is never clobbered.
+# Design notes (2026-11-27):
+# - 3x/day cadence (~40-170 commits/batch) keeps sync PRs small and reviewable
+#   and self-heals if GitHub drops an individual fork cron slot.
+# - `git rerere` + actions/cache on `.git/rr-cache` replays prior conflict
+#   resolutions automatically instead of re-failing on the same hunks.
+# - One bot-owned branch, `bot/upstream-sync`, updated in place.
+# - Never clobbers a branch carrying a human commit (checked by author & committer).
+# - Post-sync step disables any newly imported non-maiavm-* workflows so
+#   inherited upstream workflows on blacksmith-* runners never hang PR checks.
 
 on:
   schedule:
-    # 06:23 UTC every Monday. Aligns with hermes-deploy's weekly pin bump.
-    # 2026-11-16: jittered + file touched to re-register the schedule — GitHub
-    # silently dropped both fork crons after the 2026-11-05 default-branch
-    # switch (zero scheduled runs since; dispatch still worked).
-    - cron: '23 6 * * 1'
+    # 3x/day UTC: 06:17, 14:17, 22:17
+    - cron: '17 6,14,22 * * *'
   workflow_dispatch:
     inputs:
       upstream_sha:
@@ -33,6 +27,7 @@ on:
         type: string
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -50,8 +45,6 @@ jobs:
       # touch .github/workflows (GITHUB_TOKEN cannot), and so the sync PR
       # triggers CI. See FORK.md.
       GH_TOKEN: ${{ secrets.MAIAVM_SYNC_TOKEN || github.token }}
-      # Alert sinks, first configured one wins: the Nub ops Telegram bot (same chat
-      # as the platform's ops alerts), else a Slack/Discord/generic webhook.
       MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN }}
       MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID }}
       MAIAVM_SYNC_ALERT_WEBHOOK: ${{ secrets.MAIAVM_SYNC_ALERT_WEBHOOK }}
@@ -63,6 +56,20 @@ jobs:
           ref: maiavm
           fetch-depth: 0
           token: ${{ secrets.MAIAVM_SYNC_TOKEN || github.token }}
+
+      - name: Restore git rerere cache
+        uses: actions/cache@v4
+        with:
+          path: .git/rr-cache
+          key: rr-cache-maiavm-${{ github.run_id }}
+          restore-keys: |
+            rr-cache-maiavm-
+
+      - name: Enable git rerere
+        shell: bash
+        run: |
+          git config rerere.enabled true
+          git config rerere.autoupdate true
 
       - name: Fetch upstream (read-only)
         shell: bash
@@ -103,10 +110,11 @@ jobs:
           echo "behind=$behind" >> "$GITHUB_OUTPUT"
 
           # Never clobber a human conflict resolution. If the remote branch has
-          # commits not authored by the bot since maiavm, leave it alone.
+          # commits whose author or committer is not github-actions[bot], leave it alone.
           if git fetch --quiet origin "refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH" 2>/dev/null; then
-            human="$(git log --format='%ae' "$FORK_SHA..origin/$SYNC_BRANCH" 2>/dev/null \
-              | grep -v '^41898282+github-actions\[bot\]@users.noreply.github.com$' \
+            bot_email='41898282+github-actions\[bot\]@users\.noreply\.github\.com'
+            human="$(git log --format='%ae%n%ce' "$FORK_SHA..origin/$SYNC_BRANCH" 2>/dev/null \
+              | grep -vE "^($bot_email|noreply@github\.com)$" \
               | head -1 || true)"
             if [ -n "$human" ]; then
               echo "state=human_branch" >> "$GITHUB_OUTPUT"
@@ -118,12 +126,23 @@ jobs:
           git switch -c "$SYNC_BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git merge --no-ff --no-edit -m "Merge upstream/main into maiavm ($(date -u +%Y-%m-%d))" "$UPSTREAM_SHA"; then
+
+          if git merge --no-ff --no-commit "$UPSTREAM_SHA"; then
+            git commit --no-edit -m "Merge upstream/main into maiavm ($(date -u +%Y-%m-%d))"
+            echo "rerere_resolved=0" >> "$GITHUB_OUTPUT"
             echo "state=clean" >> "$GITHUB_OUTPUT"
           else
-            git diff --name-only --diff-filter=U | sort > "$RUNNER_TEMP/conflicts.txt"
-            git merge --abort
-            echo "state=conflict" >> "$GITHUB_OUTPUT"
+            # Check if git rerere + autoupdate resolved all conflicted paths
+            unresolved="$(git diff --name-only --diff-filter=U | sort)"
+            if [ -z "$unresolved" ]; then
+              git commit --no-edit -m "Merge upstream/main into maiavm ($(date -u +%Y-%m-%d), rerere)"
+              echo "rerere_resolved=1" >> "$GITHUB_OUTPUT"
+              echo "state=clean" >> "$GITHUB_OUTPUT"
+            else
+              printf '%s\n' "$unresolved" > "$RUNNER_TEMP/conflicts.txt"
+              git merge --abort
+              echo "state=conflict" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Push and open/update the rolling PR
@@ -134,6 +153,10 @@ jobs:
           git push --force-with-lease origin "$SYNC_BRANCH"
           pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --base maiavm \
             --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')"
+          rerere_note=""
+          if [ "${{ steps.prep.outputs.rerere_resolved }}" = "1" ]; then
+            rerere_note="- Conflicts auto-resolved via \`git rerere\` (review carefully before merging)"
+          fi
           {
             echo "Automated upstream integration candidate (see FORK.md)."
             echo ""
@@ -141,6 +164,7 @@ jobs:
             echo "- \`maiavm\` before this merge: \`$FORK_SHA\`"
             echo "- Merge base: \`$MERGE_BASE\`"
             echo "- Upstream commits brought in: $BEHIND"
+            if [ -n "$rerere_note" ]; then echo "$rerere_note"; fi
             echo ""
             echo "Review before merging — upstream behaviour changes reach production"
             echo "through this PR. After merging, cut a tag with **maiavm release tag**"
@@ -155,6 +179,21 @@ jobs:
               --body-file "$RUNNER_TEMP/pr-body.md"
           fi
 
+      - name: Keep inherited upstream workflows disabled on fork
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # Only maiavm-* workflows should stay active on the fork so upstream
+          # workflows targeting blacksmith-* runners never hang PR checks.
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active" and ((.path | startswith(".github/workflows/maiavm-")) | not)) | .id' \
+            | while read -r wf_id; do
+                [ -n "$wf_id" ] || continue
+                gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$wf_id/disable" >/dev/null 2>&1 || true
+              done
+
       - name: Report a conflict
         if: steps.prep.outputs.state == 'conflict'
         shell: bash
@@ -163,14 +202,14 @@ jobs:
           {
             echo "## Upstream sync blocked"
             echo ""
-            echo "Could not merge \`$UPSTREAM_SHA\` into \`maiavm\` cleanly."
+            echo "Could not merge \`$UPSTREAM_SHA\` into \`maiavm\` cleanly ($BEHIND commits behind)."
             echo "The existing \`$SYNC_BRANCH\` branch and PR were left untouched."
             echo ""
             echo "Conflicting files:"
             echo ""
             while IFS= read -r f; do echo "- \`$f\`"; done < "$RUNNER_TEMP/conflicts.txt"
             echo ""
-            echo "Resolve on a \`sync/*\` branch from \`maiavm\` (\`git merge $UPSTREAM_SHA\`),"
+            echo "Resolve locally with \`scripts/sync-upstream.ps1\` or on a \`sync/*\` branch from \`maiavm\` (\`git merge $UPSTREAM_SHA\`),"
             echo "push it, and open a PR into \`maiavm\`. See FORK.md."
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
@@ -192,7 +231,7 @@ jobs:
               echo "::warning::No alert channel configured (set MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN + _CHAT_ID, or MAIAVM_SYNC_ALERT_WEBHOOK); only this run's summary reports it."
             fi
           }
-          send_alert "maiavm upstream sync BLOCKED at $UPSTREAM_SHA. Conflicting files: $(paste -sd, "$RUNNER_TEMP/conflicts.txt"). Resolve on a sync/* branch from maiavm and open a PR. The existing bot/upstream-sync PR was untouched."
+          send_alert "maiavm upstream sync BLOCKED at $UPSTREAM_SHA ($BEHIND behind). Conflicting files: $(paste -sd, "$RUNNER_TEMP/conflicts.txt"). Resolve on a sync/* branch from maiavm and open a PR."
           exit 1
 
       - name: Report a human-owned branch
@@ -204,7 +243,7 @@ jobs:
             echo ""
             echo "\`$SYNC_BRANCH\` carries a commit not authored by the sync bot."
             echo "Left untouched so a manual conflict resolution is never clobbered."
-            echo "Upstream commit considered: \`$UPSTREAM_SHA\`."
+            echo "Upstream commit considered: \`$UPSTREAM_SHA\` ($BEHIND behind)."
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 

@@ -359,7 +359,7 @@ async def scan_skill_hub(identifier: str = "", profile: Optional[str] = None):
 
 @router.get("/api/skills")
 async def get_skills(profile: Optional[str] = None):
-    from tools.skills_tool import _find_all_skills, load_env, skill_setup_status
+    from tools.skills_tool import find_all_skills, load_env, skill_setup_status
     from hermes_cli.skills_config import get_disabled_skills
     from tools.skill_usage import (
         _external_skill_names, _read_bundled_names, _read_hub_installed_names, activity_count, load_usage)
@@ -368,7 +368,7 @@ async def get_skills(profile: Optional[str] = None):
         with _profile_scope(profile):
             config = load_config()
             disabled = get_disabled_skills(config)
-            skills = _find_all_skills(skip_disabled=True, with_requirements=True)
+            skills = find_all_skills(skip_disabled=True, with_requirements=True)
             # Readiness (setup_needed / missing_* / required_env) is evaluated against the
             # requested profile's .env, so it must run inside the scope. Names + is_set only.
             env_snapshot = load_env()

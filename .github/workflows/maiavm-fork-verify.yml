@@ -1,0 +1,44 @@
+name: maiavm fork verify
+
+# Fork-only (see FORK.md): fast, reliable verification of the fork's core
+# surface on PRs and pushes to `maiavm`, replacing the inherited upstream
+# workflows that hang on blacksmith-* runners.
+
+on:
+  pull_request:
+    branches: [maiavm]
+  push:
+    branches: [maiavm]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maiavm-fork-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: github.repository == 'DevvGwardo/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run fork regression suite
+        run: |
+          uv run --with pytest pytest -q \
+            tests/test_hermes_constants.py \
+            tests/gateway/test_api_server_dashboard_runs_native.py \
+            tests/gateway/test_api_server_run_prompts.py \
+            tests/gateway/test_dashboard_sessions_control.py \
+            tests/hermes_cli/test_notifications_bus.py \
+            tests/hermes_cli/test_web_server_skills_profiles.py \
+            tests/tools/test_ssh_environment.py
