@@ -1939,6 +1939,31 @@ async def handle_session_subagents(adapter: Any, registry: RunBufferRegistry, re
     })
 
 
+def attach_to_adapter(adapter: Any, app: "web.Application") -> None:
+    """Install the dashboard runs API on one api_server adapter/router.
+
+    Called from ``APIServerAdapter.connect()``; keeps the registry on the
+    adapter so later repair scripts and tests still find it under the legacy
+    ``_dashboard_run_registry`` name. A build lacking run_buffer still serves
+    the native ``/v1/runs`` endpoints.
+    """
+    if getattr(adapter, "_dashboard_run_registry", None) is None:
+        try:
+            adapter._dashboard_run_registry = RunBufferRegistry()
+        except Exception as exc:  # pragma: no cover - import guard
+            logger.warning("[api_server] dashboard run registry disabled: %s", exc)
+            adapter._dashboard_run_registry = None
+    registry = adapter._dashboard_run_registry
+    if registry is None:
+        return
+    try:
+        register_routes(app, adapter, registry)
+        registry.start_sweeper(asyncio.get_running_loop())
+        logger.info("[api_server] /v1/dashboard/runs routes registered")
+    except Exception as exc:  # pragma: no cover
+        logger.warning("[api_server] failed to register dashboard runs: %s", exc)
+
+
 def register_routes(app: "web.Application", adapter: Any, registry: RunBufferRegistry) -> None:
     """Wire the dashboard endpoints into the api_server's aiohttp app."""
 

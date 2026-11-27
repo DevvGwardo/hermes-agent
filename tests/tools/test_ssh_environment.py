@@ -498,6 +498,29 @@ class TestRemoteKillOnTimeout:
         env._kill_process(proc)
         assert self.helpers == []
 
+    def test_the_marker_is_seen_while_a_control_line_is_held_back(self, monkeypatch):
+        """The cwd-fallback collector keeps a leading control line in ``_pending``, releasing it
+        through ``_append_locked`` instead of the bounded window. The marker watch scans each
+        streamed chunk before that branch, so the closing marker is still seen and a finished
+        wrapper is not killed remotely."""
+        from tools.environments.base_output import _BoundedOutputCollector
+
+        env = SSHEnvironment(host="h", user="u")
+        proc, _ = self._spawn(monkeypatch, env)
+        m = env._cwd_marker
+        out = _BoundedOutputCollector(10_000, control_marker=env._cwd_fallback_marker)
+        out.watch_cwd_marker(m)
+        # The fallback line leads the stream and is held back in _pending.
+        out.append(f"\n{env._cwd_fallback_marker}/home/alice{env._cwd_fallback_marker}\n")
+        assert not out.cwd_marker_seen
+        # The closing marker arrives in a later chunk whose tail is released via _append_locked.
+        out.append(f"still working\n{m}/opt/data/workspace{m}\n")
+        assert out.cwd_marker_seen
+        proc._hermes_wait_output = out
+        self.helpers.clear()
+        env._kill_process(proc)
+        assert self.helpers == []
+
     def test_a_finished_wrapper_only_kills_the_client(self, monkeypatch):
         """The wrapper printed its closing CWD marker: what holds the channel is a job it left in
         the background (``cmd &``, the process registry's ``( nohup … ) &``), which must survive."""

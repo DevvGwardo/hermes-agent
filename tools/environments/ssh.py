@@ -31,9 +31,6 @@ logger = logging.getLogger(__name__)
 # Skip multiplexing there; each command pays a fresh connection but the backend works. See #73927.
 _SSH_MULTIPLEX = os.name != "nt"
 
-# Module-level binding: tests patch ``ssh._load_hermes_env_vars`` to fake the .env file.
-_load_hermes_env_vars = load_hermes_env_vars
-
 # Killing the local ``ssh`` client on a timeout or interrupt does not stop the remote command:
 # with no pty, sshd sends it no signal when the channel closes, and a command that never writes
 # output never gets SIGPIPE, so it ran on for good (a wait loop survived 17h). Each command now
@@ -402,7 +399,7 @@ class SSHEnvironment(BaseEnvironment):
         client's env carries the values, so secrets never enter the remote ``bash -c`` argv. The
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
         scope are unset remotely so a shared host cannot serve another profile's value."""
-        values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
+        values, unset_names = resolve_passthrough_env(hermes_env_loader=load_hermes_env_vars)
         token = _new_call_token()  # lets _kill_process find the remote command (see _remote_kill_script)
         remote = f": {token}; {prepend_unset(cmd_string, unset_names)}"
         cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(remote), login)

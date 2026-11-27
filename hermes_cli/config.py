@@ -2459,11 +2459,6 @@ def _write_env_lines(env_path: Path, lines: list, *, preserve_mode: bool, newlin
         _secure_file(env_path)
 
 
-def _env_value_for_write(key: str, value: str) -> str:
-    """The exact value ``save_env_value`` puts on disk for ``key`` (line breaks and non-ASCII gone)."""
-    from agent.secret_scope import strip_env_line_breaks
-
-    return _check_non_ascii_credential(key, strip_env_line_breaks(value))
 def _quote_env_value(value: str) -> str:
     """Quote .env values containing characters with special dotenv meaning. Any whitespace
     (including internal runs) is quoted so ``set -a; . file`` word-splitting keeps paths intact."""
@@ -2569,7 +2564,8 @@ def save_env_value(key: str, value: str, env_path: Optional[Path] = None):
         return
     validate_env_var_name_for_write(key)
     refuse_redacted_env_value(key, value)
-    value = _env_value_for_write(key, value)
+    from agent.secret_scope import strip_env_line_breaks
+    value = _check_non_ascii_credential(key, strip_env_line_breaks(value))
     ensure_hermes_home()
     env_path = Path(env_path) if env_path is not None else get_env_path()
     with _env_write_lock(env_path):
@@ -2587,6 +2583,7 @@ def save_env_value(key: str, value: str, env_path: Optional[Path] = None):
         _write_env_lines(env_path, lines, preserve_mode=env_path.exists())
     _publish_env_value(key, value)
     invalidate_env_cache()
+    return value
 
 
 def custom_endpoint_key_env(identity: str) -> str:

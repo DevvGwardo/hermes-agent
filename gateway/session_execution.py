@@ -8,7 +8,6 @@ import logging
 import queue
 import re
 import threading
-import time
 from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -19,6 +18,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.session_api_turn import api_runtime_locked
+from gateway.session_execution_fork import classify_evicted_agent, release_evicted_agents
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -38,7 +38,6 @@ class GatewaySessionAgentMixin:
         agent: Any = None
         reused: bool = False
         evicted: Any = None  # agent evicted under the lock; released off-lock on a daemon thread
-        evicted_running: Any = None  # evicted while mid-turn; released once that turn ends
 
     def _skip_context_files(self, platform_key) -> bool:
         """gateway.platforms.<plat>.skip_context_files: messaging platforms may opt out of
@@ -110,11 +109,7 @@ class GatewaySessionAgentMixin:
                 # this entry, so release the displaced agent instead of orphaning its clients.
                 # A mid-turn agent is never torn down (same rule as ``_evict_cached_agent``).
                 logger.info("Agent cache invalidated for session %s: config signature changed", ctx.session_key)
-                evicted = self._pop_cached_agent_for_eviction()
-                if evicted is not None and id(evicted) in self._runner._running_agent_ids():
-                    out.evicted_running = evicted
-                else:
-                    out.evicted = evicted
+                classify_evicted_agent(self, out)
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -161,29 +156,6 @@ class GatewaySessionAgentMixin:
             self._runner._release_evicted_agent_soft, (agent,), f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
             inline_fallback=True, session_key=self._ctx.session_key,
         )
-
-    _MIDTURN_RELEASE_POLL_S = 5.0
-    _MIDTURN_RELEASE_MAX_WAIT_S = 3 * 3600.0
-
-    def _release_evicted_agent_when_idle(self, agent) -> None:
-        """A config change replaced an agent that is still mid-turn (the fresh one now owns the cache
-        slot). Never tear it down under a live turn: wait off-thread until it leaves the running set,
-        then soft-release it, instead of leaking its client pool to the GC. Gives up after the cap."""
-        runner = self._runner
-
-        def _wait_then_release(a) -> None:
-            deadline = time.monotonic() + self._MIDTURN_RELEASE_MAX_WAIT_S
-            while id(a) in runner._running_agent_ids():
-                if time.monotonic() >= deadline:
-                    return
-                time.sleep(self._MIDTURN_RELEASE_POLL_S)
-            runner._release_evicted_agent_soft(a)
-
-        with suppress(Exception):
-            runner._spawn_release_thread(
-                _wait_then_release, (agent,), f"agent-midturn-evict-{str(self._ctx.session_key)[:24]}",
-                inline_fallback=False, session_key=self._ctx.session_key,
-            )
 
     def _build_fresh_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations,
                            reasoning_config, pr, skip_context_files):
@@ -254,10 +226,7 @@ class GatewaySessionAgentMixin:
                 cache.pop(ctx.session_key, None)
         if found.reused and agent is not None:
             self._runner._apply_fallback_chain_to_agent(agent, None if locked else runner._refresh_fallback_model())
-        if found.evicted is not None:
-            self._release_evicted_agent(found.evicted)
-        if found.evicted_running is not None:
-            self._release_evicted_agent_when_idle(found.evicted_running)
+        release_evicted_agents(self, found)
         if agent is None:
             from tools.delegate_tool_config import gateway_delegation_inline, gateway_delegation_inline_scope
             # delegation.gateway_mode from this turn's own (profile-scoped) config and the chat's resolved interim

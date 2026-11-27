@@ -16,15 +16,18 @@ GitHub opens fork PRs against the parent repo by default. When you open a PR, ch
 ## Releases and pinning
 
 - Production (the hermes-deploy VM image) pins a **tag** like `maiavm-2026.09.26` or an exact commit SHA. It never follows a moving branch.
-- To cut a tag, run Actions → **maiavm release tag** → Run workflow on `maiavm`. It tags the current `maiavm` head as `maiavm-YYYY.MM.DD` (adding `-2`, `-3`… for more tags on the same day).
+- To cut a tag, run Actions → **maiavm release tag** → Run workflow on `maiavm`. It tags the current `maiavm` head as `maiavm-YYYY.MM.DD` (adding `-2`, `-3`… for more tags on the same day). The annotated tag message names the integrated upstream SHA: the workflow resolves it from the merged sync PR body (which records `Upstream commit: <sha>`), falling back to `git rev-parse origin/upstream` and then the newest mirror commit contained in `maiavm`. That makes a tag self-describing for audit and rollback.
 - Before moving the fleet to a new tag, roll one canary VM with it and click through the Nub Agent app. Only then bump the pin in hermes-deploy.
 - Tag names deliberately don't match `v*.*.*`, so they never trigger the inherited upstream release and installer workflows.
+- If the repo secret `HERMES_DEPLOY_DISPATCH_TOKEN` is set (a PAT with `repo` scope on `Maia-VM/hermes-deploy`), the release workflow also fires a `repository_dispatch` there with `event_type: fork-release` and the new tag (plus this repo) in `client_payload`. The step is guarded by `if: env.DISPATCH_TOKEN != ''`, so tagging still succeeds when the secret has not been provisioned yet — the run summary just notes that the dispatch was skipped.
 
 ## Keeping up with upstream
 
 Upstream moves thousands of commits a day. The `maiavm-upstream-sync` workflow
-runs **weekly** (Mondays, 06:17 UTC); you can also run it by hand and pass an
-explicit upstream commit. Each run:
+runs **3x/day** (06:17, 14:17, 22:17 UTC); you can also run it by hand and pass an
+explicit upstream commit. Batches stay small (~40–170 commits), and the run
+cache for `.git/rr-cache` lets `git rerere` replay conflict resolutions already
+made on this fork instead of failing on the same hunks over and over. Each run:
 
 1. Mirrors upstream `main` to the `upstream` branch.
 2. Resolves one upstream commit for the run (the head of `main` at start, or the
@@ -33,9 +36,11 @@ explicit upstream commit. Each run:
 4. Otherwise merges it into the single rolling branch **`bot/upstream-sync`**:
    - **Clean merge:** force-with-lease updates that branch and creates or
      updates ONE open PR into `maiavm`.
-   - **Conflicts:** leaves the existing branch and PR untouched, writes the
-     conflicting files to the run summary, posts them to
-     `MAIAVM_SYNC_ALERT_WEBHOOK` if that secret is set, and fails the run.
+   - **Conflicts:** `git rerere` with autoupdate commits the merge if it can
+     replay every resolution (flagged in the PR body as "auto-resolved — review
+     carefully"). Otherwise the existing branch and PR are left untouched, the
+     conflicting files go to the run summary and to `MAIAVM_SYNC_ALERT_WEBHOOK`
+     / the Telegram secrets if set, and the run fails.
    - **Human commit on the branch:** skips, so a manual resolution is never
      clobbered.
 
@@ -43,19 +48,25 @@ explicit upstream commit. Each run:
 resolve a conflict by hand, work on a `sync/*` branch from `maiavm`, push it and
 open a PR; the bot will keep out of the way until it merges.
 
-**Cadence.** Detection/integration candidates are weekly and deliberately not
-daily: a daily merge of a fast-moving upstream is not a reviewable unit. Release
-from a tag, never from the branch — cut `maiavm-YYYY.MM.DD` only after the
-upstream PR is merged, then canary one VM before hermes-deploy's pin moves.
-Sync PRs are never auto-merged; review them like any other change, since
-upstream behaviour changes reach production through them.
+**Cadence.** Detection/integration candidates are cut 3x/day rather than daily
+because a daily merge of a fast-moving upstream is not a reviewable unit: smaller
+batches with replayed `rerere` resolutions make each PR reviewable. Sync PRs are
+never auto-merged; review them like any other change, since upstream behaviour
+changes reach production through them. Release from a tag, never from the branch
+— cut `maiavm-YYYY.MM.DD` only after the upstream PR is merged, then canary one
+VM before hermes-deploy's pin moves.
 
 **Alerts.** Set the repo secret `MAIAVM_SYNC_ALERT_WEBHOOK` (Slack, Discord, or
-a Telegram webhook bridge) so a blocked sync reaches a human. It is optional
-and only affects alerting; without it, a conflict is visible only on the run
-page. `maiavm-sync-watchdog.yml` runs daily and alerts when the sync has not
-produced a successful run in 10 days, or has not run at all in 8 — the failure
-mode that let the 2026-09-28 sync sit dead for five weeks unnoticed.
+a Telegram webhook bridge) and/or `MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN` +
+`MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID` so a blocked sync reaches a human. These are
+optional and only affect alerting; without them, a conflict is visible only on
+the run page. `maiavm-sync-watchdog.yml` runs **2x/day** (07:49, 19:49 UTC) and is
+**lag-based**: it measures the real `origin/maiavm..upstream/main` commit lag and
+alerts when `maiavm` is more than 600 commits behind, when the last sync failed
+with no success in 48h, or when a sync PR has been open longer than 48h. If no
+sync run has happened in 18h it self-heals by dispatching
+`maiavm-upstream-sync.yml`. This replaced an older time-based watchdog that let
+the 2026-09-28 sync sit dead for five weeks unnoticed.
 
 **Token.** Upstream often changes `.github/workflows/*`. The default `GITHUB_TOKEN` is not allowed to push workflow changes, and PRs it opens don't trigger CI. Add a fine-grained PAT as the repo secret **`MAIAVM_SYNC_TOKEN`** with these permissions on this repo only:
 
@@ -68,9 +79,51 @@ Without the secret the workflow still runs, but mirroring fails whenever upstrea
 
 Scheduled workflows are off by default in forks. Enable them once under the **Actions** tab.
 
+## Fork-only CI
+
+`maiavm-fork-verify.yml` is the fork's fast, reliable verification: on PRs and
+pushes to `maiavm` it installs dependencies with `uv sync` and runs a focused
+`uv run --with pytest pytest -q` suite over the fork-owned and fork-modified
+surfaces — `tests/test_hermes_constants.py`, the gateway API/server, dashboard
+runs and agent-cache tests, the hermes_cli config/credential/notification/web-server
+tests, and `tests/tools/test_ssh_environment.py`. It replaced the inherited
+upstream workflows that target `blacksmith-*` runners; those are disabled through
+the GitHub API (`disabled_manually`) by the sync workflow so they never hang fork
+PRs. When a new fork patch lands, add its regression test to this list.
+
+## Resolving conflicts locally
+
+When a sync merge conflicts, use `scripts/sync-upstream.ps1` from a clean tree:
+
+```powershell
+./scripts/sync-upstream.ps1 -UpstreamSha <sha> -Push -OpenPr
+```
+
+It enables `rerere`, adds the `upstream` remote if needed, fetches `origin/maiavm`
+and `upstream/main`, reports how far the target commit is ahead, and creates
+`sync/upstream-YYYYMMDD` from `origin/maiavm` with a `--no-ff --no-commit` merge.
+Resolve the listed conflicts, then `git add -A && git commit`; `-Push` pushes the
+branch and `-OpenPr` opens the PR into `maiavm` for you. This mirrors what the bot
+does in CI, so the resolution is recorded in `.git/rr-cache` and replayed on the
+next sync instead of conflicting again.
+
+## Patch inventory and convergence roadmap
+
+`PATCHES.md` is the authoritative inventory of every line that differs from
+`NousResearch/hermes-agent:main`, plus the roadmap for shrinking that surface so
+syncs converge without manual intervention. It documents the sync automation
+architecture (3x/day `rerere` sync, lag-based watchdog, fork CI, local helper),
+the zero-core patches that belong in a plugin or hermes-deploy's managed config,
+minimal-hook isolation for hot upstream files, and upstreamable bug fixes to
+contribute as neutral PRs. Consult it before adding a core patch — if a patch
+isn't listed there, add it, and check whether a plugin or managed config can
+carry it instead. Keep this file and `PATCHES.md` in sync when the automation or
+the patch surface changes.
+
 ## Keeping the patch layer thin
 
-Every line that differs from upstream is a potential conflict on each sync.
+Every line that differs from upstream is a potential conflict on each sync. The
+per-file inventory and plan to shrink it live in `PATCHES.md`.
 
 - **SaaS-specific behaviour** (Nub wording, defaults, extra dashboard routes) belongs in a plugin installed by hermes-deploy (see `plugins/` and the dashboard plugin routers under `/api/plugins/<name>`), or in the managed-scope config (`/etc/hermes/config.yaml`, `hermes_cli/managed_scope.py`) that hermes-deploy writes on each VM. It does not belong in core files here.
 - **Core patches** are only for things a plugin can't do. Keep each one small and conventional-commit titled, and list it below so sync conflicts are easy to reason about.
