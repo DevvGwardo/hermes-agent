@@ -1,24 +1,18 @@
 name: maiavm sync watchdog
 
-# Fork-only (see FORK.md). The upstream sync can fail silently: a red scheduled
-# run notifies nobody, and a conflict used to try `gh issue create` on a repo
-# where Issues are disabled. This watchdog is the second line of defence — it
-# alerts when the sync has not produced a successful run recently, or has
-# stopped firing at all.
-#
-# Alert sink: the same Telegram bot + chat (or webhook) the sync uses. Without one
-# the failure is visible only in this run's summary.
+# Fork-only (see FORK.md). Measures actual commit lag against
+# NousResearch/hermes-agent:main, checks latest sync run health and open PR age,
+# and self-heals dropped fork crons by dispatching maiavm-upstream-sync.yml.
 
 on:
   schedule:
-    # 2026-11-16: jittered + file touched to re-register the schedule (see
-    # the upstream-sync note: both fork crons were dead since 2026-11-05).
-    - cron: '49 7 * * *'
+    - cron: '49 7,19 * * *'
   workflow_dispatch:
 
 permissions:
-  actions: read
+  actions: write
   contents: read
+  pull-requests: read
 
 jobs:
   check:
@@ -30,40 +24,69 @@ jobs:
       MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN }}
       MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID: ${{ secrets.MAIAVM_SYNC_ALERT_TELEGRAM_CHAT_ID }}
       MAIAVM_SYNC_ALERT_WEBHOOK: ${{ secrets.MAIAVM_SYNC_ALERT_WEBHOOK }}
-      MAX_SUCCESS_AGE_DAYS: '10'
-      MAX_RUN_AGE_DAYS: '8'
+      MAX_BEHIND_COMMITS: '600'
+      MAX_RUN_AGE_HOURS: '18'
+      MAX_SUCCESS_AGE_HOURS: '48'
+      MAX_OPEN_PR_HOURS: '48'
     steps:
-      - name: Check the sync workflow's freshness
+      - name: Check upstream commit lag and sync health
         shell: bash
         run: |
           set -euo pipefail
           wf="maiavm-upstream-sync.yml"
           api="repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs"
-          last_success="$(gh api "$api?status=success&per_page=1" --jq '.workflow_runs[0].created_at // empty')"
-          last_any="$(gh api "$api?per_page=1" --jq '.workflow_runs[0].created_at // empty')"
-          now="$(date -u +%s)"
-          problems=""
 
-          age_days() {
+          # Measure real commit lag without downloading blobs
+          git init -q watchdog-git
+          cd watchdog-git
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git remote add upstream "https://github.com/NousResearch/hermes-agent.git"
+          git fetch --no-tags --filter=blob:none origin maiavm
+          git fetch --no-tags --filter=blob:none upstream main
+          behind_commits="$(git rev-list --count origin/maiavm..upstream/main)"
+          cd ..
+
+          last_run_json="$(gh api "$api?per_page=1" --jq '.workflow_runs[0] // {}')"
+          last_any="$(jq -r '.created_at // empty' <<<"$last_run_json")"
+          last_conclusion="$(jq -r '.conclusion // .status // empty' <<<"$last_run_json")"
+          last_success="$(gh api "$api?status=success&per_page=1" --jq '.workflow_runs[0].created_at // empty')"
+          open_pr_created="$(gh pr list --repo "$GITHUB_REPOSITORY" --base maiavm --head bot/upstream-sync --state open --json createdAt --jq '.[0].createdAt // empty')"
+
+          now="$(date -u +%s)"
+          age_hours() {
             [ -n "$1" ] || { echo 999999; return; }
-            echo $(( (now - $(date -u -d "$1" +%s)) / 86400 ))
+            echo $(( (now - $(date -u -d "$1" +%s)) / 3600 ))
           }
 
-          success_age="$(age_days "$last_success")"
-          run_age="$(age_days "$last_any")"
-
-          if [ "$run_age" -gt "$MAX_RUN_AGE_DAYS" ]; then
-            problems="${problems}The sync workflow has not run in ${run_age} days (last run: ${last_any:-never}). "
+          run_age_h="$(age_hours "$last_any")"
+          success_age_h="$(age_hours "$last_success")"
+          pr_age_h=0
+          if [ -n "$open_pr_created" ]; then
+            pr_age_h="$(age_hours "$open_pr_created")"
           fi
-          if [ "$success_age" -gt "$MAX_SUCCESS_AGE_DAYS" ]; then
-            problems="${problems}No successful upstream sync in ${success_age} days (last success: ${last_success:-never}). "
+
+          problems=""
+          if [ "$run_age_h" -gt "$MAX_RUN_AGE_HOURS" ]; then
+            problems="${problems}Sync workflow has not run in ${run_age_h}h (last: ${last_any:-never}); dispatching now. "
+            gh workflow run "$wf" --repo "$GITHUB_REPOSITORY" --ref maiavm || true
+          fi
+          if [ "$last_conclusion" = "failure" ] && [ "$success_age_h" -gt "$MAX_SUCCESS_AGE_HOURS" ]; then
+            problems="${problems}Latest sync run failed (${last_any}) and no success in ${success_age_h}h. "
+          fi
+          if [ "$behind_commits" -gt "$MAX_BEHIND_COMMITS" ]; then
+            problems="${problems}maiavm is ${behind_commits} commits behind NousResearch/hermes-agent:main (threshold: ${MAX_BEHIND_COMMITS}). "
+          fi
+          if [ -n "$open_pr_created" ] && [ "$pr_age_h" -gt "$MAX_OPEN_PR_HOURS" ]; then
+            problems="${problems}Open bot/upstream-sync PR has been waiting ${pr_age_h}h. "
           fi
 
           {
             echo "## maiavm sync watchdog"
             echo ""
-            echo "- Last sync run: ${last_any:-never} (${run_age} days ago)"
-            echo "- Last successful sync: ${last_success:-never} (${success_age} days ago)"
+            echo "- Upstream lag: **${behind_commits}** commits behind \`NousResearch/hermes-agent:main\`"
+            echo "- Last sync run: ${last_any:-never} (${run_age_h}h ago, conclusion: ${last_conclusion:-none})"
+            echo "- Last successful sync: ${last_success:-never} (${success_age_h}h ago)"
+            echo "- Open sync PR age: ${open_pr_created:-none} (${pr_age_h}h)"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -89,8 +112,8 @@ jobs:
               curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$payload" \
                 "$MAIAVM_SYNC_ALERT_WEBHOOK" || echo "::warning::alert webhook failed"
             else
-              echo "::warning::No alert channel configured (set MAIAVM_SYNC_ALERT_TELEGRAM_TOKEN + _CHAT_ID, or MAIAVM_SYNC_ALERT_WEBHOOK); only this run's summary reports it."
+              echo "::warning::No alert channel configured; only this run's summary reports it."
             fi
           }
-          send_alert "maiavm sync watchdog: ${problems}Check the maiavm-upstream-sync workflow (conflict or disabled schedule)."
+          send_alert "maiavm sync watchdog: ${problems}"
           exit 1
